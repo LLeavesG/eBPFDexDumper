@@ -23,3 +23,22 @@ fix ndk path and make
 ```
 make
 ```
+
+## Reference
+https://github.com/cilium/ebpf
+
+https://github.com/null-luo/btrace
+
+https://blog.seeflower.dev/archives/84/#title-7
+
+https://evilpan.com/2021/12/26/art-internal/
+
+https://zhuanlan.zhihu.com/p/523692715
+
+https://blog.csdn.net/weixin_47668107/article/details/114251185
+
+https://juejin.cn/post/7045575502991458340
+
+https://juejin.cn/post/7384992816906747913
+
+https://blog.quarkslab.com/dji-the-art-of-obfuscation.html
