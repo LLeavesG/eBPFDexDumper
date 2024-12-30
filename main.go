@@ -136,6 +136,7 @@ func parse_libart(path string) (uint64, uint64, uint64) {
 			offsetVerifyClass = sym.Value
 		}
 	}
+	fmt.Printf("offsetExecute: %x offsetExecuteNterp: %x offsetVerifyClass: %x\n", offsetExecute, offsetExecuteNterp, offsetVerifyClass)
 	return offsetExecute, offsetExecuteNterp, offsetVerifyClass
 }
 
@@ -169,7 +170,7 @@ func main() {
 	if len(os.Args) < 7 {
 		fmt.Printf("Usage: %s <uid> <pathToLibart> <offsetExecute(hex)> <offsetExecuteNterpImpl(hex)> <offsetVerifyClass(hex)> <outputPath>\n", os.Args[0])
 		fmt.Printf("Example ( if Auto get offset ): %s 10244 /apex/com.android.art/lib64/libart.so 0 0 0 /data/local/tmp/dexfile\n", os.Args[0])
-		fmt.Printf("Example (if get offset failed): %s 10244 /apex/com.android.art/lib64/libart.so 0x473E48 0x473E48 0x3D9F18 /data/local/tmp/dexfile\n", os.Args[0])
+		fmt.Printf("Example (if get offset failed): %s 10244 /apex/com.android.art/lib64/libart.so 0x473E48 0x200090 0x3D9F18 /data/local/tmp/dexfile\n", os.Args[0])
 		os.Exit(1)
 	}
 

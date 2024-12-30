@@ -14,7 +14,7 @@ HEADERS = headers
 VMLINUX_HEADERS = vmlinux/arm64
 
 BPF_OUTPUT = bpf
-BINARY_NAME = ebpf-out
+BINARY_NAME = eBPFDexDumper
 
 ANDROID_NDK_ROOT = /home/lleaves/android-ndk-r25c
 
@@ -34,7 +34,7 @@ tidy:
 	$(GO_MOD_TIDY)
 
 build: tidy
-	CC=$(CC) CXX=$(CXX) GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=$(CGO_ENABLED) $(GO_BUILD)
+	CC=$(CC) CXX=$(CXX) GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=$(CGO_ENABLED) $(GO_BUILD) -buildvcs=false
 
 clean:
 	rm -f $(BPF_OUTPUT)_$(TARGET)_bpfel.go $(BPF_OUTPUT)_$(TARGET)_bpfel.o $(BINARY_NAME)
