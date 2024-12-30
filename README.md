@@ -13,6 +13,21 @@ Usage: ./eBPFDexDumper <uid> <pathToLibart> <offsetExecute(hex)> <offsetExecuteN
 Example ( if Auto get offset ): ./eBPFDexDumper 10244 /apex/com.android.art/lib64/libart.so 0 0 0 /data/local/tmp/dexfile
 Example (if get offset failed): ./eBPFDexDumper 10244 /apex/com.android.art/lib64/libart.so 0x473E48 0x200090 0x3D9F18 /data/local/tmp/dexfile
 ```
+**uid**: UID of App you want to dump
+
+**pathToLibart**: `libart.so path`, check by cat /proc/<pid>/maps
+
+**offsetExecute(hex)**: offset(hex) of `art::interpreter::Execute` in libart.so
+
+**offsetExecuteNterpImpl(hex)**: offset(hex) of `ExecuteNterpImpl` in libart.so
+
+**offsetVerifyClass(hex)**: offset(hex) of `art::verifier::ClassVerifier::VerifyClass` in libart.so
+
+**outputPath**: dumped dex file path
+
+>By default, the symbols of libart.so will be parsed automatically.
+The three offsets can be filled in freely, but if they are not found, you need to specify them manually, so it is recommended to fill in all 0s or all the correct offsets.
+
 ![image](https://github.com/user-attachments/assets/43e9d9ac-c56c-4dd7-9349-8d4fed1b6207)
 ![image](https://github.com/user-attachments/assets/565d1761-baa2-42cc-99c6-47eae703fee1)
 
