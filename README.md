@@ -12,6 +12,8 @@ Show: https://blog.lleavesg.top/article/eBPFDexDumper
 
 **If other Android version , please fix the code and Compile.**
 
+**Delete `/data/app/xxxx/xxxx-packagename/oat` folder first(check by `pm path packagename`), used to delete oat optimization content, to avoid the inability to dump or dump out `cdex`, etc.**
+
 ```
 Usage: ./eBPFDexDumper <uid> <pathToLibart> <offsetExecute(hex)> <offsetExecuteNterpImpl(hex)> <offsetVerifyClass(hex)> <outputPath>
 Example ( if Auto get offset ): ./eBPFDexDumper 10244 /apex/com.android.art/lib64/libart.so 0 0 0 /data/local/tmp/dexfile
@@ -19,13 +21,13 @@ Example (if get offset failed): ./eBPFDexDumper 10244 /apex/com.android.art/lib6
 ```
 **uid**: UID of App you want to dump
 
-**pathToLibart**: `libart.so path`, check by cat /proc/<pid>/maps
+**pathToLibart**: `libart.so` path, check by cat `/proc/<pid>/maps`
 
-**offsetExecute(hex)**: offset(hex) of `art::interpreter::Execute` in libart.so
+**offsetExecute(hex)**: offset(hex) of `art::interpreter::Execute` in `libart.so`
 
-**offsetExecuteNterpImpl(hex)**: offset(hex) of `ExecuteNterpImpl` in libart.so
+**offsetExecuteNterpImpl(hex)**: offset(hex) of `ExecuteNterpImpl` in `libart.so`
 
-**offsetVerifyClass(hex)**: offset(hex) of `art::verifier::ClassVerifier::VerifyClass` in libart.so
+**offsetVerifyClass(hex)**: offset(hex) of `art::verifier::ClassVerifier::VerifyClass` in `libart.so`
 
 **outputPath**: dumped dex file path
 
