@@ -1,12 +1,16 @@
 # eBPF-DexDumper
 Android dexDumper based on eBPF
 
+* Undetectable
+* Passive dump
 
 Show: https://blog.lleavesg.top/article/eBPFDexDumper
 
 ## Usage
 
-ps: uid means filter uid
+**Test Env: Android 13 Pixel6**
+
+**If other Android version , please fix the code and Compile.**
 
 ```
 Usage: ./eBPFDexDumper <uid> <pathToLibart> <offsetExecute(hex)> <offsetExecuteNterpImpl(hex)> <offsetVerifyClass(hex)> <outputPath>
@@ -32,7 +36,7 @@ The three offsets can be filled in freely, but if they are not found, you need t
 ![image](https://github.com/user-attachments/assets/565d1761-baa2-42cc-99c6-47eae703fee1)
 
 
-## Complie
+## Compile
 fix ndk path and make
 
 ```
