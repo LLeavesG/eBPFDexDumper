@@ -136,7 +136,7 @@ func parse_libart(path string) (uint64, uint64, uint64) {
 			offsetVerifyClass = sym.Value
 		}
 	}
-	fmt.Printf("offsetExecute: %x offsetExecuteNterp: %x offsetVerifyClass: %x\n", offsetExecute, offsetExecuteNterp, offsetVerifyClass)
+	log.Printf("[+] offsetExecute: %x offsetExecuteNterp: %x offsetVerifyClass: %x\n", offsetExecute, offsetExecuteNterp, offsetVerifyClass)
 	return offsetExecute, offsetExecuteNterp, offsetVerifyClass
 }
 

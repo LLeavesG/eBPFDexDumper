@@ -8,7 +8,7 @@ PACKAGE = main
 BPF_FILE = bpf.c
 
 # TYPE = -type trace_event -type trace_config
-TYPE = -type config_t -type simple_buf
+TYPE = -type config_t
 
 HEADERS = headers
 VMLINUX_HEADERS = vmlinux/arm64

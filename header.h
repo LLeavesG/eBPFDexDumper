@@ -15,24 +15,6 @@ typedef struct config_t{
 } *config_t;
 
 
-#define MAX_PERCPU_BUFSIZE  (1 << 15)    // This value is actually set by the kernel as an upper bound
-
-#define SUBMIT_BUF_IDX      0
-
-#define MAX_BUFFERS         3
-
-typedef struct simple_buf {
-    u8 buf[MAX_PERCPU_BUFSIZE];
-} buf_t;
-
-// Percpu global buffer variables
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __type(key, u32);
-    __type(value, buf_t);
-    __uint(max_entries, MAX_BUFFERS);
-} bufs SEC(".maps");
-
 // Events submission
 struct {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);

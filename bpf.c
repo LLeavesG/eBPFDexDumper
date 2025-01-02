@@ -2,7 +2,6 @@
 #include "header.h"
 
 const struct config_t *unused_config_t __attribute__((unused));
-const struct simple_buf *unused_simple_buf __attribute__((unused));
 
 static int config_loaded = 0;
 static bool filter_enable = false;
@@ -34,11 +33,6 @@ bool trace_allowed(u32 pid, u32 uid)
     return true;
 }
 
-static __always_inline buf_t* get_buf(int idx)
-{
-    return bpf_map_lookup_elem(&bufs, &idx);
-}
-
 SEC("uprobe/libart_execute")
 int uprobe_libart_execute(struct pt_regs *ctx)
 {
@@ -48,10 +42,7 @@ int uprobe_libart_execute(struct pt_regs *ctx)
         return 0;
     }
 
-    buf_t *submit_p = get_buf(SUBMIT_BUF_IDX);
-    if (submit_p == NULL)
-        return 0;
-    
+u8 buf[4 + 8 + 4];
     
     unsigned char *shadow_frame_ptr = (unsigned char *)PT_REGS_PARM3(ctx);
 
@@ -91,11 +82,11 @@ int uprobe_libart_execute(struct pt_regs *ctx)
             return 0;
         }
         
-        bpf_probe_read(&(submit_p->buf[0]), sizeof(u32), &pid);
-        bpf_probe_read(&(submit_p->buf[0 + 4]), sizeof(u64), &begin);
-        bpf_probe_read(&(submit_p->buf[0 + 4 + 8]), sizeof(u32), &size);
+        bpf_probe_read(&(buf[0]), sizeof(u32), &pid);
+        bpf_probe_read(&(buf[0 + 4]), sizeof(u64), &begin);
+        bpf_probe_read(&(buf[0 + 4 + 8]), sizeof(u32), &size);
 
-        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, submit_p, 4 + 8 + 4);
+        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, buf, 4 + 8 + 4);
         bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
     }
 
@@ -110,10 +101,8 @@ int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
         return 0;
     }
 
-    buf_t *submit_p = get_buf(SUBMIT_BUF_IDX);
-    if (submit_p == NULL)
-        return 0;
-    
+    u8 buf[4 + 8 + 4];
+
     unsigned char *art_method_ptr = (unsigned char *)PT_REGS_PARM1(ctx);
 
     unsigned char *declaring_class_ptr;
@@ -145,11 +134,11 @@ int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
             return 0;
         }
         
-        bpf_probe_read(&(submit_p->buf[0]), sizeof(u32), &pid);
-        bpf_probe_read(&(submit_p->buf[0 + 4]), sizeof(u64), &begin);
-        bpf_probe_read(&(submit_p->buf[0 + 4 + 8]), sizeof(u32), &size);
+        bpf_probe_read(&(buf[0]), sizeof(u32), &pid);
+        bpf_probe_read(&(buf[0 + 4]), sizeof(u64), &begin);
+        bpf_probe_read(&(buf[0 + 4 + 8]), sizeof(u32), &size);
 
-        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, submit_p, 4 + 8 + 4);
+        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, buf, 4 + 8 + 4);
         bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
     }
     return 0;
@@ -164,9 +153,7 @@ int uprobe_libart_verifyClass(struct pt_regs *ctx)
         return 0;
     }
 
-    buf_t *submit_p = get_buf(SUBMIT_BUF_IDX);
-    if (submit_p == NULL)
-        return 0;
+    u8 buf[4 + 8 + 4];
 
     unsigned char *dex_file_ptr = (unsigned char *)PT_REGS_PARM3(ctx);
     
@@ -190,11 +177,11 @@ int uprobe_libart_verifyClass(struct pt_regs *ctx)
             return 0;
         }
         
-        bpf_probe_read(&(submit_p->buf[0]), sizeof(u32), &pid);
-        bpf_probe_read(&(submit_p->buf[0 + 4]), sizeof(u64), &begin);
-        bpf_probe_read(&(submit_p->buf[0 + 4 + 8]), sizeof(u32), &size);
+        bpf_probe_read(&(buf[0]), sizeof(u32), &pid);
+        bpf_probe_read(&(buf[0 + 4]), sizeof(u64), &begin);
+        bpf_probe_read(&(buf[0 + 4 + 8]), sizeof(u32), &size);
 
-        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, submit_p, 4 + 8 + 4);
+        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, buf, 4 + 8 + 4);
         bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
     }
     return 0;
