@@ -9,10 +9,10 @@
 #define MAX_ARGS_NUM 16
 
 
-typedef struct config_t{
+struct config_t{
 	uid_t uid;
 	pid_t pid;
-} *config_t;
+};
 
 
 // Events submission

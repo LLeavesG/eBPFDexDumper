@@ -1,7 +1,7 @@
 //go:build ignore
 #include "header.h"
 
-const struct config_t *unused_config_t __attribute__((unused));
+const struct config_ *unused_config_t __attribute__((unused));
 
 static int config_loaded = 0;
 static bool filter_enable = false;
