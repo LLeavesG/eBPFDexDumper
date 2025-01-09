@@ -14,6 +14,12 @@ struct config_t{
 	pid_t pid;
 };
 
+struct event_data_t {
+    u64 begin;
+    u32 pid;
+    u32 size;
+};
+
 
 // Events submission
 struct {
@@ -41,11 +47,7 @@ struct
 } dexFileCache_map SEC(".maps");
 
 
-
 #define INVALID_UID_PID ((uid_t)-1)
-
-
-
 
 struct pt_regs;
 #define PT_REGS_ARM64 const volatile struct user_pt_regs

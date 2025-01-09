@@ -35,8 +35,8 @@ import (
 )
 
 type dexDumpHeader struct {
-	Pid   uint32
 	Begin uint64
+	Pid   uint32
 	Size  uint32
 }
 
