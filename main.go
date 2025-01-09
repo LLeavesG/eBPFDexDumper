@@ -115,10 +115,9 @@ func parse_libart(path string) (uint64, uint64, uint64) {
 	var offsetExecuteNterp uint64
 	var offsetVerifyClass uint64
 
-	// 遍历所有符号
 	syms, err := f.Symbols()
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Failed to read symbols: %v", err)
 	}
 
 	for _, sym := range syms {
@@ -193,9 +192,8 @@ func main() {
 	log.Printf("Filtering on uid %d", bpfConfig.Uid)
 
 	offsetExecute, offsetExecuteNterp, offsetVerifyClass = parse_libart(libArtPath)
-
 	if offsetExecute == 0 || offsetExecuteNterp == 0 || offsetVerifyClass == 0 {
-		log.Fatalf("Failed to parse libart.so , need give the offset", err)
+		log.Printf("Failed to parse libart.so , need give the offset")
 		offsetExecuteStr := os.Args[3]
 		offsetNterpStr := os.Args[4]
 		offsetVerifyClassStr := os.Args[5]

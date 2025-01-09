@@ -11,7 +11,7 @@ BPF_FILE = bpf.c
 TYPE = -type config_t -type event_data_t
 
 HEADERS = headers
-VMLINUX_HEADERS = vmlinux/arm64
+VMLINUX_HEADERS = vmlinux/$(TARGET)
 
 BPF_OUTPUT = bpf
 BINARY_NAME = eBPFDexDumper
@@ -22,7 +22,7 @@ ANDROID_NDK_ROOT = /home/lleaves/android-ndk-r25c
 CC = "${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
 CXX = "${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang++"
 GOOS = android
-GOARCH = arm64
+GOARCH = $(TARGET)
 CGO_ENABLED = 1
 
 all: bpf tidy build
