@@ -43,28 +43,28 @@ int uprobe_libart_execute(struct pt_regs *ctx)
     }
 
     struct event_data_t evt = {};
-    
+    __builtin_memset(&evt, 0, sizeof(evt)); 
     unsigned char *shadow_frame_ptr = (unsigned char *)PT_REGS_PARM3(ctx);
 
-    unsigned char *art_method_ptr;
+    unsigned char *art_method_ptr = 0;
     bpf_probe_read_user(&art_method_ptr, sizeof(u64), shadow_frame_ptr + 8);
     // bpf_printk("art_method_ptr: %llx", art_method_ptr);
 
-    unsigned char *declaring_class_ptr;
+    unsigned char *declaring_class_ptr = 0;
     bpf_probe_read_user(&declaring_class_ptr, sizeof(u32), art_method_ptr);
     // bpf_printk("declaring_class_ptr: %llx", declaring_class_ptr);
 
-    unsigned char *dex_cache_ptr;
+    unsigned char *dex_cache_ptr = 0;
     bpf_probe_read_user(&dex_cache_ptr, sizeof(u64), declaring_class_ptr + 0x10);
     // bpf_printk("dex_cache_ptr: %llx", dex_cache_ptr);
 
-    unsigned char *dex_file_ptr;
+    unsigned char *dex_file_ptr = 0;
     bpf_probe_read_user(&dex_file_ptr, sizeof(u64), dex_cache_ptr + 0x10);
     // bpf_printk("dex_file_ptr: %llx", dex_file_ptr);
     
-    u64 begin;
-    u32 size;
-    char ch;
+    u64 begin = 0;
+    u32 size = 0;
+    u8 ch = 0;
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
     bpf_probe_read_user(&size, sizeof(u32), dex_file_ptr + 0x10);
 
@@ -101,21 +101,21 @@ int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
     }
 
     struct event_data_t evt = {};
-
+    __builtin_memset(&evt, 0, sizeof(evt)); 
     unsigned char *art_method_ptr = (unsigned char *)PT_REGS_PARM1(ctx);
 
-    unsigned char *declaring_class_ptr;
+    unsigned char *declaring_class_ptr = 0;
     bpf_probe_read_user(&declaring_class_ptr, sizeof(u32), art_method_ptr);
     
-    unsigned char *dex_cache_ptr;
+    unsigned char *dex_cache_ptr = 0;
     bpf_probe_read_user(&dex_cache_ptr, sizeof(u64), declaring_class_ptr + 0x10);
 
-    unsigned char *dex_file_ptr;
+    unsigned char *dex_file_ptr = 0;
     bpf_probe_read_user(&dex_file_ptr, sizeof(u64), dex_cache_ptr + 0x10);
     
-    u64 begin;
-    u32 size;
-    char ch;
+    u64 begin = 0;
+    u32 size = 0;
+    u8 ch = 0;
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
     bpf_probe_read_user(&size, sizeof(u32), dex_file_ptr + 0x10);
 
@@ -153,12 +153,12 @@ int uprobe_libart_verifyClass(struct pt_regs *ctx)
     }
 
     struct event_data_t evt = {};
-
+    __builtin_memset(&evt, 0, sizeof(evt)); 
     unsigned char *dex_file_ptr = (unsigned char *)PT_REGS_PARM3(ctx);
     
-    u64 begin;
-    u32 size;
-    char ch;
+    u64 begin = 0;
+    u32 size = 0;
+    u8 ch = 0;
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
     bpf_probe_read_user(&size, sizeof(u32), dex_file_ptr + 0x10);
 
