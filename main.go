@@ -17,77 +17,288 @@ ssize_t readRemoteMem(pid_t pid, void *dst, size_t len, void *src) {
 import "C"
 import (
 	"bytes"
+	"context"
 	"debug/elf"
 	"encoding/binary"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 	"unsafe"
 
-	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/perf"
-	"github.com/cilium/ebpf/rlimit"
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/btf"
+	manager "github.com/gojue/ebpfmanager"
+	"golang.org/x/sys/unix"
 )
 
-type dexDumpHeader struct {
-	Begin uint64
-	Pid   uint32
-	Size  uint32
-}
+type dexDumpHeader = bpfEventDataT
+type methodEventHeader = bpfMethodEventDataT
 
 var outputPath string
 
-func parseEvent(record perf.Record, obj bpfObjects) {
+type DexDumper struct {
+	manager    *manager.Manager
+	libArtPath string
+	uid        uint32
+}
 
-	if record.LostSamples != 0 {
-		log.Printf("\033[91mperf event ring buffer full, lost %d samples\033[00m", record.LostSamples)
+func NewDexDumper(libArtPath string, uid uint32, outputDir string) *DexDumper {
+	outputPath = outputDir
+
+	return &DexDumper{
+		libArtPath: libArtPath,
+		uid:        uid,
+	}
+}
+
+// Asset 简单的资产文件加载函数
+func Asset(filename string) ([]byte, error) {
+	return ioutil.ReadFile(filename)
+}
+
+func SetupManagerOptions() (manager.Options, error) {
+	// 对于没有开启 CONFIG_DEBUG_INFO_BTF 的加载额外的 btf.Spec
+	btfFile := ""
+	bpfManagerOptions := manager.Options{}
+
+	if !CheckConfig("CONFIG_DEBUG_INFO_BTF=y") {
+		btfFile = FindBTFAssets()
+	}
+
+	if btfFile != "" {
+		// 尝试从系统路径加载 BTF 文件
+		var byteBuf []byte
+		var err error
+
+		// 首先尝试从 assets 目录加载
+		byteBuf, err = Asset("assets/" + btfFile)
+		if err != nil {
+			// 如果 assets 目录不存在，尝试直接从文件系统加载
+			byteBuf, err = Asset(btfFile)
+			if err != nil {
+				log.Printf("Warning: Failed to load BTF file %s: %v", btfFile, err)
+				// 如果 BTF 文件加载失败，使用基本配置
+				return manager.Options{
+					RLimit: &unix.Rlimit{
+						Cur: unix.RLIM_INFINITY,
+						Max: unix.RLIM_INFINITY,
+					},
+				}, nil
+			}
+		}
+
+		spec, err := btf.LoadSpecFromReader(bytes.NewReader(byteBuf))
+		if err != nil {
+			log.Printf("Warning: Failed to parse BTF spec: %v", err)
+			return manager.Options{
+				RLimit: &unix.Rlimit{
+					Cur: unix.RLIM_INFINITY,
+					Max: unix.RLIM_INFINITY,
+				},
+			}, nil
+		}
+
+		bpfManagerOptions = manager.Options{
+			DefaultKProbeMaxActive: 512,
+			VerifierOptions: ebpf.CollectionOptions{
+				Programs: ebpf.ProgramOptions{
+					LogSize:     2097152,
+					KernelTypes: spec,
+				},
+			},
+			RLimit: &unix.Rlimit{
+				Cur: math.MaxUint64,
+				Max: math.MaxUint64,
+			},
+		}
+	} else {
+		bpfManagerOptions = manager.Options{
+			DefaultKProbeMaxActive: 512,
+			VerifierOptions: ebpf.CollectionOptions{
+				Programs: ebpf.ProgramOptions{
+					LogSize: 2097152,
+				},
+			},
+			RLimit: &unix.Rlimit{
+				Cur: math.MaxUint64,
+				Max: math.MaxUint64,
+			},
+		}
+	}
+	return bpfManagerOptions, nil
+}
+
+func (dd *DexDumper) setupManager() error {
+	offsetExecute, offsetExecuteNterp, offsetVerifyClass := parse_libart(dd.libArtPath)
+	if offsetExecute == 0 || offsetExecuteNterp == 0 || offsetVerifyClass == 0 {
+		return fmt.Errorf("failed to parse libart.so offsets")
+	}
+
+	log.Printf("[+] offsetExecute: %x offsetExecuteNterp: %x offsetVerifyClass: %x\n",
+		offsetExecute, offsetExecuteNterp, offsetVerifyClass)
+
+	// 创建 manager 配置
+	dd.manager = &manager.Manager{
+		Probes: []*manager.Probe{
+			{
+				UID:              "execute",
+				EbpfFuncName:     "uprobe_libart_execute",
+				Section:          "uprobe/libart_execute",
+				BinaryPath:       dd.libArtPath,
+				UAddress:         offsetExecute,
+				AttachToFuncName: "Execute",
+			},
+			{
+				UID:              "executeNterp",
+				EbpfFuncName:     "uprobe_libart_executeNterpImpl",
+				Section:          "uprobe/libart_executeNterpImpl",
+				BinaryPath:       dd.libArtPath,
+				UAddress:         offsetExecuteNterp,
+				AttachToFuncName: "ExecuteNterpImpl",
+			},
+			{
+				UID:              "verifyClass",
+				EbpfFuncName:     "uprobe_libart_verifyClass",
+				Section:          "uprobe/libart_verifyClass",
+				BinaryPath:       dd.libArtPath,
+				UAddress:         offsetVerifyClass,
+				AttachToFuncName: "VerifyClass",
+			},
+		},
+		RingbufMaps: []*manager.RingbufMap{
+			{
+				Map: manager.Map{
+					Name: "events",
+				},
+				RingbufMapOptions: manager.RingbufMapOptions{
+					DataHandler: dd.handleDexEventRingBuf,
+				},
+			},
+			{
+				Map: manager.Map{
+					Name: "method_events",
+				},
+				RingbufMapOptions: manager.RingbufMapOptions{
+					DataHandler: dd.handleMethodEventRingBuf,
+				},
+			},
+		},
+	}
+
+	return nil
+}
+
+// Start 启动 DexDumper
+func (dd *DexDumper) Start(ctx context.Context) error {
+	// setup manager
+	if err := dd.setupManager(); err != nil {
+		return fmt.Errorf("failed to setup manager: %v", err)
+	}
+
+	// init manager with BPF bytecode
+	options, err := SetupManagerOptions()
+	if err != nil {
+		return fmt.Errorf("failed to setup manager options: %v", err)
+	}
+
+	if err := dd.manager.InitWithOptions(bytes.NewReader(_BpfBytes), options); err != nil {
+		return fmt.Errorf("failed to init manager: %v", err)
+	}
+
+	// config filter map
+	configMap, found, err := dd.manager.GetMap("config_map")
+	if err != nil {
+		return fmt.Errorf("failed to get config map: %v", err)
+	}
+	if !found {
+		return fmt.Errorf("config map not found")
+	}
+
+	config := bpfConfigT{
+		Uid: dd.uid,
+		Pid: 0,
+	}
+
+	if err := configMap.Put(uint32(0), config); err != nil {
+		return fmt.Errorf("failed to put config: %v", err)
+	}
+
+	log.Printf("Filtering on uid %d", dd.uid)
+
+	// start manager
+	if err := dd.manager.Start(); err != nil {
+		return fmt.Errorf("failed to start manager: %v", err)
+	}
+
+	log.Printf("eBPF DexDumper started successfully")
+
+	// 等待停止信号
+	<-ctx.Done()
+
+	return nil
+}
+
+// Stop 停止 DexDumper
+func (dd *DexDumper) Stop() error {
+	if dd.manager != nil {
+		return dd.manager.Stop(manager.CleanAll)
+	}
+	return nil
+}
+
+// handleDexEventRingBuf 处理 Dex 文件事件 (RingBuffer版本)
+func (dd *DexDumper) handleDexEventRingBuf(CPU int, data []byte, ringBuf *manager.RingbufMap, mgr *manager.Manager) {
+	buf := bytes.NewBuffer(data)
+	dexHeader := dexDumpHeader{}
+	if err := binary.Read(buf, binary.LittleEndian, &dexHeader); err != nil {
+		log.Printf("Read dex event failed: %s", err)
 		return
 	}
-	buf := bytes.NewBuffer(record.RawSample)
 
-	// dexDumpHeader event
-	// save begin and size info
-	dexDumpHeader := dexDumpHeader{}
-	if err := binary.Read(buf, binary.LittleEndian, &dexDumpHeader); err != nil {
-		log.Printf("Read failed: %s", err)
-		return
-	}
-
-	// log.Printf("dexDumpHeader:  Pid: %d Begin: %x size: %x \n", dexDumpHeader.Pid, dexDumpHeader.Begin, dexDumpHeader.Size)
-
-	// use process_vm_readv to read the dex file
-	dexData := make([]byte, dexDumpHeader.Size)
+	// 读取 dex 文件数据
+	dexData := make([]byte, dexHeader.Size)
 	nread, _ := C.readRemoteMem(
-		C.pid_t(dexDumpHeader.Pid),
+		C.pid_t(dexHeader.Pid),
 		unsafe.Pointer(&dexData[0]),
 		C.size_t(len(dexData)),
-		unsafe.Pointer(uintptr(dexDumpHeader.Begin)),
+		unsafe.Pointer(uintptr(dexHeader.Begin)),
 	)
 	if nread < 0 {
 		log.Printf("process_vm_readv failed")
 		// retry
 		time.Sleep(1 * time.Second)
 		nread, _ = C.readRemoteMem(
-			C.pid_t(dexDumpHeader.Pid),
+			C.pid_t(dexHeader.Pid),
 			unsafe.Pointer(&dexData[0]),
 			C.size_t(len(dexData)),
-			unsafe.Pointer(uintptr(dexDumpHeader.Begin)),
+			unsafe.Pointer(uintptr(dexHeader.Begin)),
 		)
 		if nread < 0 {
-			log.Printf("process_vm_readv failed again")
-			log.Printf("process_vm_readv failed at Begin: %08x Size: %-10d", dexDumpHeader.Begin, dexDumpHeader.Size)
-			obj.bpfMaps.DexFileCacheMap.Delete(uint64(dexDumpHeader.Begin))
+			log.Printf("process_vm_readv failed again at Begin: %08x Size: %-10d", dexHeader.Begin, dexHeader.Size)
+
+			// 删除缓存项
+			dexCacheMap, found, err := dd.manager.GetMap("dexFileCache_map")
+			if err == nil && found {
+				dexCacheMap.Delete(uint64(dexHeader.Begin))
+			}
 			return
 		}
 	}
 
-	// write to file
-	fileName := fmt.Sprintf("%s/dex_%x.dex", outputPath, dexDumpHeader.Begin)
+	// 添加Dex文件到缓存，用于后续方法签名解析
+	err := dexCache.AddDexFile(dexHeader.Begin, dexData)
+	if err != nil {
+		log.Printf("Failed to add dex file to cache: %v", err)
+	}
+
+	// 写入文件
+	fileName := fmt.Sprintf("%s/dex_%x.dex", outputPath, dexHeader.Begin)
 	f, err := os.Create(fileName)
 	if err != nil {
 		log.Printf("Create file failed: %v", err)
@@ -101,7 +312,36 @@ func parseEvent(record perf.Record, obj bpfObjects) {
 		return
 	}
 	log.Printf("Dex file saved to %s, size %-10d\n", fileName, nread)
+}
 
+func (dd *DexDumper) handleMethodEventRingBuf(CPU int, data []byte, perfMap *manager.RingbufMap, manager *manager.Manager) {
+	buf := bytes.NewBuffer(data)
+	methodHeader := methodEventHeader{}
+	if err := binary.Read(buf, binary.LittleEndian, &methodHeader); err != nil {
+		log.Printf("Read method event failed: %s", err)
+		return
+	}
+
+	parser := dexCache.GetParser(methodHeader.Begin)
+	if parser == nil {
+		log.Printf("Method event: dex file not cached yet, begin=0x%x", methodHeader.Begin)
+		return
+	}
+
+	methodInfo, err := parser.GetMethodInfo(methodHeader.MethodIndex)
+	if err != nil {
+		log.Printf("Failed to get method info for index %d: %v", methodHeader.MethodIndex, err)
+		return
+	}
+
+	signature := methodInfo.PrettyMethod()
+
+	log.Printf("Method executed: %s (pid=%d, dex=0x%x, method_idx=%d, art_method=0x%x)",
+		signature,
+		methodHeader.Pid,
+		methodHeader.Begin,
+		methodHeader.MethodIndex,
+		methodHeader.ArtMethodPtr)
 }
 
 func parse_libart(path string) (uint64, uint64, uint64) {
@@ -128,7 +368,6 @@ func parse_libart(path string) (uint64, uint64, uint64) {
 		// ExecuteNterpImpl
 		if sym.Name == "ExecuteNterpImpl" {
 			offsetExecuteNterp = sym.Value
-
 		}
 		// art::verifier::ClassVerifier::VerifyClass
 		if strings.Contains(sym.Name, "3art") && strings.Contains(sym.Name, "8verifier") && strings.Contains(sym.Name, "13ClassVerifier") && strings.Contains(sym.Name, "11VerifyClass") {
@@ -140,32 +379,9 @@ func parse_libart(path string) (uint64, uint64, uint64) {
 }
 
 func main() {
-	log.SetFlags(2)
-	stopper := make(chan os.Signal, 1)
-	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	var offsetExecute uint64
-	var offsetExecuteNterp uint64
-	var offsetVerifyClass uint64
-
-	// Remove resource limits for kernels <5.11.
-	if err := rlimit.RemoveMemlock(); err != nil {
-		log.Fatal("RemoveMemlock failed: ", err)
-	}
-
-	// Load the eBPF program.
-	obj := bpfObjects{}
-	//opt := perf.ReaderOptions{}
-	if err := loadBpfObjects(&obj, nil); err != nil {
-		log.Fatal("loadBpfObjects failed: ", err)
-	}
-	defer obj.Close()
-
-	// args from command line
-
-	bpfConfig := bpfConfigT{}
-	const mapKey uint32 = 0
-
+	// 命令行参数解析
 	if len(os.Args) < 7 {
 		fmt.Printf("Usage: %s <uid> <pathToLibart> <offsetExecute(hex)> <offsetExecuteNterpImpl(hex)> <offsetVerifyClass(hex)> <outputPath>\n", os.Args[0])
 		fmt.Printf("Example ( if Auto get offset ): %s 10244 /apex/com.android.art/lib64/libart.so 0 0 0 /data/local/tmp/dexfile\n", os.Args[0])
@@ -175,97 +391,34 @@ func main() {
 
 	uidStr := os.Args[1]
 	libArtPath := os.Args[2]
-
-	outputPath = os.Args[6]
+	outputDir := os.Args[6]
 
 	uidValue, err := strconv.ParseUint(uidStr, 10, 32)
 	if err != nil {
 		log.Fatalf("Failed to parse uid: %v", err)
 	}
 
-	bpfConfig.Uid = uint32(uidValue)
-	bpfConfig.Pid = 0
+	dumper := NewDexDumper(libArtPath, uint32(uidValue), outputDir)
 
-	if err := obj.bpfMaps.ConfigMap.Put(mapKey, bpfConfig); err != nil {
-		log.Fatal("Failed to put config: ", err)
-	}
-	log.Printf("Filtering on uid %d", bpfConfig.Uid)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	offsetExecute, offsetExecuteNterp, offsetVerifyClass = parse_libart(libArtPath)
-	if offsetExecute == 0 || offsetExecuteNterp == 0 || offsetVerifyClass == 0 {
-		log.Printf("Failed to parse libart.so , need give the offset")
-		offsetExecuteStr := os.Args[3]
-		offsetNterpStr := os.Args[4]
-		offsetVerifyClassStr := os.Args[5]
-
-		offsetExecute, err = strconv.ParseUint(offsetExecuteStr, 0, 64)
-		offsetExecuteNterp, err = strconv.ParseUint(offsetNterpStr, 0, 64)
-		offsetVerifyClass, err = strconv.ParseUint(offsetVerifyClassStr, 0, 64)
-		if offsetExecute <= 0 || offsetExecuteNterp <= 0 || offsetVerifyClass <= 0 {
-			log.Fatalf("Failed to get offset, you give %x %x %x", offsetExecute, offsetExecuteNterp, offsetVerifyClass)
-		}
-	}
-
-	libArtEx, err := link.OpenExecutable(libArtPath)
-	if err != nil {
-		log.Fatal("link.OpenExecutable failed: ", err)
-	}
-
-	executeLink, err := libArtEx.Uprobe(
-		"Execute",
-		obj.UprobeLibartExecute,
-		&link.UprobeOptions{Address: offsetExecute, Offset: 0},
-	)
-	if err != nil {
-		log.Fatal("Uprobe Execute failed: ", err)
-	}
-	defer executeLink.Close()
-
-	executeNterpImplLink, err := libArtEx.Uprobe(
-		"ExecuteNterpImpl",
-		obj.UprobeLibartExecuteNterpImpl,
-		&link.UprobeOptions{Address: offsetExecuteNterp, Offset: 0},
-	)
-	if err != nil {
-		log.Fatal("Uprobe ExecuteNterpImpl failed: ", err)
-	}
-	defer executeNterpImplLink.Close()
-
-	verifyClassLink, err := libArtEx.Uprobe(
-		"VerifyClass",
-		obj.UprobeLibartVerifyClass,
-
-		&link.UprobeOptions{Address: offsetVerifyClass, Offset: 0},
-	)
-	if err != nil {
-		log.Fatal("Uprobe VerifyClass failed: ", err)
-	}
-	defer verifyClassLink.Close()
-
-	ropt := perf.ReaderOptions{}
-	rd, err := perf.NewReaderWithOptions(obj.Events, os.Getpagesize()*12, ropt)
-	if err != nil {
-		log.Fatal("perf.NewReader failed: ", err)
-	}
-	defer rd.Close()
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, unix.SIGTERM)
 
 	go func() {
-		<-stopper
-		log.Println("Stopping")
-		if err := rd.Close(); err != nil {
-			log.Fatal("perf.Reader.Close failed: ", err)
-
-		}
-		os.Exit(0)
-
+		<-sigChan
+		log.Println("Received stop signal, shutting down...")
+		cancel()
 	}()
 
-	for {
-		record, err := rd.Read()
-		if err != nil {
-			log.Fatal("perf.Reader.Read failed: ", err)
-		}
-		go parseEvent(record, obj)
+	if err := dumper.Start(ctx); err != nil {
+		log.Fatalf("Failed to start dumper: %v", err)
 	}
 
+	if err := dumper.Stop(); err != nil {
+		log.Printf("Failed to stop dumper cleanly: %v", err)
+	}
+
+	log.Println("DexDumper stopped")
 }

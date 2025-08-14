@@ -20,13 +20,26 @@ struct event_data_t {
     u32 size;
 };
 
+struct method_event_data_t {
+    u64 begin;
+    u32 pid;
+    u32 size;
+    u64 art_method_ptr;
+    u32 method_index;
+};
 
-// Events submission
+
+// Events submission for dex file dumps using ringbuf
 struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(key_size, sizeof(u32));
-    __uint(value_size, sizeof(u32));
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);
 } events SEC(".maps");
+
+// Events submission for method execution traces using ringbuf
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);
+} method_events SEC(".maps");
 
 // Config map
 struct
