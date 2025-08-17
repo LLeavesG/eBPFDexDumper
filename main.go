@@ -18,7 +18,6 @@ import "C"
 import (
 	"bytes"
 	"context"
-	"debug/elf"
 	"encoding/binary"
 	"fmt"
 	"io/ioutil"
@@ -28,6 +27,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -37,7 +37,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-type dexDumpHeader = bpfEventDataT
+type dexDumpHeader = bpfDexEventDataT
 type methodEventHeader = bpfMethodEventDataT
 
 var outputPath string
@@ -46,15 +46,9 @@ type DexDumper struct {
 	manager    *manager.Manager
 	libArtPath string
 	uid        uint32
-}
 
-func NewDexDumper(libArtPath string, uid uint32, outputDir string) *DexDumper {
-	outputPath = outputDir
-
-	return &DexDumper{
-		libArtPath: libArtPath,
-		uid:        uid,
-	}
+	mu             sync.RWMutex                 // 新增：缓存读写锁
+	methodSigCache map[uint64]map[uint32]string // 新增：Begin -> (methodIndex -> signature)
 }
 
 // Asset 简单的资产文件加载函数
@@ -135,42 +129,85 @@ func SetupManagerOptions() (manager.Options, error) {
 }
 
 func (dd *DexDumper) setupManager() error {
-	offsetExecute, offsetExecuteNterp, offsetVerifyClass := parse_libart(dd.libArtPath)
-	if offsetExecute == 0 || offsetExecuteNterp == 0 || offsetVerifyClass == 0 {
-		return fmt.Errorf("failed to parse libart.so offsets")
+	symMap := parse_libart(dd.libArtPath)
+
+	var offsetExecute uint64
+	var offsetExecuteNterp uint64
+	var offsetVerifyClass uint64
+
+	for name, off := range symMap {
+		// art::interpreter::Execute
+		if offsetExecute == 0 && strings.Contains(name, "3art") && strings.Contains(name, "11interpreter") && strings.Contains(name, "7Execute") {
+			offsetExecute = off
+			continue
+		}
+		// ExecuteNterpImpl
+		if offsetExecuteNterp == 0 && name == "ExecuteNterpImpl" {
+			offsetExecuteNterp = off
+			continue
+		}
+		// art::verifier::ClassVerifier::VerifyClass
+		if offsetVerifyClass == 0 && strings.Contains(name, "3art") && strings.Contains(name, "8verifier") && strings.Contains(name, "13ClassVerifier") && strings.Contains(name, "11VerifyClass") {
+			offsetVerifyClass = off
+			continue
+		}
 	}
 
-	log.Printf("[+] offsetExecute: %x offsetExecuteNterp: %x offsetVerifyClass: %x\n",
-		offsetExecute, offsetExecuteNterp, offsetVerifyClass)
+	if offsetExecute == 0 || offsetExecuteNterp == 0 || offsetVerifyClass == 0 {
+		return fmt.Errorf("failed to parse libart.so offsets (Execute=%x, Nterp=%x, VerifyClass=%x)",
+			offsetExecute, offsetExecuteNterp, offsetVerifyClass)
+	}
 
-	// 创建 manager 配置
-	dd.manager = &manager.Manager{
-		Probes: []*manager.Probe{
-			{
-				UID:              "execute",
-				EbpfFuncName:     "uprobe_libart_execute",
-				Section:          "uprobe/libart_execute",
-				BinaryPath:       dd.libArtPath,
-				UAddress:         offsetExecute,
-				AttachToFuncName: "Execute",
-			},
-			{
-				UID:              "executeNterp",
-				EbpfFuncName:     "uprobe_libart_executeNterpImpl",
-				Section:          "uprobe/libart_executeNterpImpl",
-				BinaryPath:       dd.libArtPath,
-				UAddress:         offsetExecuteNterp,
-				AttachToFuncName: "ExecuteNterpImpl",
-			},
-			{
-				UID:              "verifyClass",
-				EbpfFuncName:     "uprobe_libart_verifyClass",
-				Section:          "uprobe/libart_verifyClass",
-				BinaryPath:       dd.libArtPath,
-				UAddress:         offsetVerifyClass,
-				AttachToFuncName: "VerifyClass",
-			},
+	// 查找所有匹配的指令序列
+	pattern := []byte{0x03, 0x0C, 0x40, 0xF9, 0x5F, 0x00, 0x03, 0xEB}
+	patternUaddrs, err := findPatternUaddrs(dd.libArtPath, pattern)
+	if err != nil {
+		log.Printf("[-] pattern scan error: %v", err)
+	} else {
+		log.Printf("[+] found %d pattern sites", len(patternUaddrs))
+	}
+
+	probes := []*manager.Probe{
+		{
+			UID:              "execute",
+			EbpfFuncName:     "uprobe_libart_execute",
+			Section:          "uprobe/libart_execute",
+			BinaryPath:       dd.libArtPath,
+			UAddress:         offsetExecute,
+			AttachToFuncName: "Execute",
 		},
+		{
+			UID:              "executeNterp",
+			EbpfFuncName:     "uprobe_libart_executeNterpImpl",
+			Section:          "uprobe/libart_executeNterpImpl",
+			BinaryPath:       dd.libArtPath,
+			UAddress:         offsetExecuteNterp,
+			AttachToFuncName: "ExecuteNterpImpl",
+		},
+		// {
+		// 	UID:              "verifyClass",
+		// 	EbpfFuncName:     "uprobe_libart_verifyClass",
+		// 	Section:          "uprobe/libart_verifyClass",
+		// 	BinaryPath:       dd.libArtPath,
+		// 	UAddress:         offsetVerifyClass,
+		// 	AttachToFuncName: "VerifyClass",
+		// },
+	}
+
+	// 为每个匹配位置追加一个 uprobe（使用绝对偏移 UAddress）
+	for i, addr := range patternUaddrs {
+		probes = append(probes, &manager.Probe{
+			UID:              fmt.Sprintf("pattern_check_%d", i),
+			EbpfFuncName:     "uprobe_libart_nterpOpInvoke",
+			Section:          "uprobe/libart_nterpOpInvoke",
+			BinaryPath:       dd.libArtPath,
+			UAddress:         addr,
+			AttachToFuncName: fmt.Sprintf("nterp_op_invoke_%d", i),
+		})
+	}
+
+	dd.manager = &manager.Manager{
+		Probes: probes,
 		RingbufMaps: []*manager.RingbufMap{
 			{
 				Map: manager.Map{
@@ -191,6 +228,8 @@ func (dd *DexDumper) setupManager() error {
 		},
 	}
 
+	log.Printf("[+] offsetExecute: %x offsetExecuteNterp: %x offsetVerifyClass: %x",
+		offsetExecute, offsetExecuteNterp, offsetVerifyClass)
 	return nil
 }
 
@@ -250,6 +289,16 @@ func (dd *DexDumper) Stop() error {
 		return dd.manager.Stop(manager.CleanAll)
 	}
 	return nil
+}
+
+func NewDexDumper(libArtPath string, uid uint32, outputDir string) *DexDumper {
+	outputPath = outputDir
+
+	return &DexDumper{
+		libArtPath:     libArtPath,
+		uid:            uid,
+		methodSigCache: make(map[uint64]map[uint32]string), // 新增：初始化缓存
+	}
 }
 
 // handleDexEventRingBuf 处理 Dex 文件事件 (RingBuffer版本)
@@ -324,19 +373,37 @@ func (dd *DexDumper) handleMethodEventRingBuf(CPU int, data []byte, perfMap *man
 
 	parser := dexCache.GetParser(methodHeader.Begin)
 	if parser == nil {
-		log.Printf("Method event: dex file not cached yet, begin=0x%x", methodHeader.Begin)
+		// log.Printf("Method event: dex file not cached yet, begin=0x%x", methodHeader.Begin)
 		return
 	}
 
-	methodInfo, err := parser.GetMethodInfo(methodHeader.MethodIndex)
-	if err != nil {
-		log.Printf("Failed to get method info for index %d: %v", methodHeader.MethodIndex, err)
-		return
+	var signature string
+	dd.mu.RLock()
+	if mm, ok := dd.methodSigCache[methodHeader.Begin]; ok {
+		if sig, ok2 := mm[methodHeader.MethodIndex]; ok2 {
+			signature = sig
+		}
+	}
+	dd.mu.RUnlock()
+
+	if signature == "" {
+		methodInfo, err := parser.GetMethodInfo(methodHeader.MethodIndex)
+		if err != nil {
+			log.Printf("Failed to get method info for index %d: %v", methodHeader.MethodIndex, err)
+			return
+		}
+		signature = methodInfo.PrettyMethod()
+
+		dd.mu.Lock()
+		if _, ok := dd.methodSigCache[methodHeader.Begin]; !ok {
+			dd.methodSigCache[methodHeader.Begin] = make(map[uint32]string)
+		}
+		dd.methodSigCache[methodHeader.Begin][methodHeader.MethodIndex] = signature
+		dd.mu.Unlock()
+
 	}
 
-	signature := methodInfo.PrettyMethod()
-
-	log.Printf("Method executed: %s (pid=%d, dex=0x%x, method_idx=%d, art_method=0x%x)",
+	log.Printf("%s (pid=%d, dex=0x%x, method_idx=%d, art_method=0x%x)",
 		signature,
 		methodHeader.Pid,
 		methodHeader.Begin,
@@ -344,42 +411,10 @@ func (dd *DexDumper) handleMethodEventRingBuf(CPU int, data []byte, perfMap *man
 		methodHeader.ArtMethodPtr)
 }
 
-func parse_libart(path string) (uint64, uint64, uint64) {
-	f, err := elf.Open(path)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer f.Close()
-
-	var offsetExecute uint64
-	var offsetExecuteNterp uint64
-	var offsetVerifyClass uint64
-
-	syms, err := f.Symbols()
-	if err != nil {
-		log.Printf("Failed to read symbols: %v", err)
-	}
-
-	for _, sym := range syms {
-		// art::interpreter::Execute
-		if strings.Contains(sym.Name, "3art") && strings.Contains(sym.Name, "11interpreter") && strings.Contains(sym.Name, "7Execute") {
-			offsetExecute = sym.Value
-		}
-		// ExecuteNterpImpl
-		if sym.Name == "ExecuteNterpImpl" {
-			offsetExecuteNterp = sym.Value
-		}
-		// art::verifier::ClassVerifier::VerifyClass
-		if strings.Contains(sym.Name, "3art") && strings.Contains(sym.Name, "8verifier") && strings.Contains(sym.Name, "13ClassVerifier") && strings.Contains(sym.Name, "11VerifyClass") {
-			offsetVerifyClass = sym.Value
-		}
-	}
-	log.Printf("[+] offsetExecute: %x offsetExecuteNterp: %x offsetVerifyClass: %x\n", offsetExecute, offsetExecuteNterp, offsetVerifyClass)
-	return offsetExecute, offsetExecuteNterp, offsetVerifyClass
-}
-
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	// log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.SetFlags(0)
+	log.SetOutput(os.Stdout)
 
 	// 命令行参数解析
 	if len(os.Args) < 7 {

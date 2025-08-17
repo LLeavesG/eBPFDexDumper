@@ -17,7 +17,7 @@ type bpfConfigT struct {
 	Pid int32
 }
 
-type bpfEventDataT struct {
+type bpfDexEventDataT struct {
 	Begin uint64
 	Pid   uint32
 	Size  uint32
@@ -27,6 +27,7 @@ type bpfMethodEventDataT struct {
 	Begin        uint64
 	Pid          uint32
 	Size         uint32
+	Thread       uint64
 	ArtMethodPtr uint64
 	MethodIndex  uint32
 	_            [4]byte
@@ -75,6 +76,7 @@ type bpfSpecs struct {
 type bpfProgramSpecs struct {
 	UprobeLibartExecute          *ebpf.ProgramSpec `ebpf:"uprobe_libart_execute"`
 	UprobeLibartExecuteNterpImpl *ebpf.ProgramSpec `ebpf:"uprobe_libart_executeNterpImpl"`
+	UprobeLibartNterpOpInvoke    *ebpf.ProgramSpec `ebpf:"uprobe_libart_nterpOpInvoke"`
 	UprobeLibartVerifyClass      *ebpf.ProgramSpec `ebpf:"uprobe_libart_verifyClass"`
 }
 
@@ -128,6 +130,7 @@ func (m *bpfMaps) Close() error {
 type bpfPrograms struct {
 	UprobeLibartExecute          *ebpf.Program `ebpf:"uprobe_libart_execute"`
 	UprobeLibartExecuteNterpImpl *ebpf.Program `ebpf:"uprobe_libart_executeNterpImpl"`
+	UprobeLibartNterpOpInvoke    *ebpf.Program `ebpf:"uprobe_libart_nterpOpInvoke"`
 	UprobeLibartVerifyClass      *ebpf.Program `ebpf:"uprobe_libart_verifyClass"`
 }
 
@@ -135,6 +138,7 @@ func (p *bpfPrograms) Close() error {
 	return _BpfClose(
 		p.UprobeLibartExecute,
 		p.UprobeLibartExecuteNterpImpl,
+		p.UprobeLibartNterpOpInvoke,
 		p.UprobeLibartVerifyClass,
 	)
 }

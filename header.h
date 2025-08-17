@@ -14,7 +14,7 @@ struct config_t{
 	pid_t pid;
 };
 
-struct event_data_t {
+struct dex_event_data_t {
     u64 begin;
     u32 pid;
     u32 size;
@@ -24,7 +24,10 @@ struct method_event_data_t {
     u64 begin;
     u32 pid;
     u32 size;
+
+    u64 thread;
     u64 art_method_ptr;
+
     u32 method_index;
 };
 
@@ -32,13 +35,13 @@ struct method_event_data_t {
 // Events submission for dex file dumps using ringbuf
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
+    __uint(max_entries, 1 << 24);
 } events SEC(".maps");
 
 // Events submission for method execution traces using ringbuf
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
+    __uint(max_entries, 1 << 24);
 } method_events SEC(".maps");
 
 // Config map
