@@ -340,13 +340,11 @@ func (dd *DexDumper) handleDexEventRingBuf(CPU int, data []byte, ringBuf *manage
 		}
 	}
 
-	// 添加Dex文件到缓存，用于后续方法签名解析
 	err := dexCache.AddDexFile(dexHeader.Begin, dexData)
 	if err != nil {
 		log.Printf("Failed to add dex file to cache: %v", err)
 	}
 
-	// 写入文件
 	fileName := fmt.Sprintf("%s/dex_%x.dex", outputPath, dexHeader.Begin)
 	f, err := os.Create(fileName)
 	if err != nil {
@@ -364,11 +362,28 @@ func (dd *DexDumper) handleDexEventRingBuf(CPU int, data []byte, ringBuf *manage
 }
 
 func (dd *DexDumper) handleMethodEventRingBuf(CPU int, data []byte, perfMap *manager.RingbufMap, manager *manager.Manager) {
+	if len(data) < int(unsafe.Sizeof(methodEventHeader{})) {
+		log.Printf("Method event data too short: %d bytes", len(data))
+		return
+	}
+
 	buf := bytes.NewBuffer(data)
 	methodHeader := methodEventHeader{}
 	if err := binary.Read(buf, binary.LittleEndian, &methodHeader); err != nil {
 		log.Printf("Read method event failed: %s", err)
 		return
+	}
+
+	// Read bytecode if present
+	var bytecode []byte
+	if methodHeader.CodeitemSize > 0 {
+		expectedSize := int(unsafe.Sizeof(methodHeader)) + int(methodHeader.CodeitemSize)
+		if len(data) >= expectedSize {
+			bytecode = data[unsafe.Sizeof(methodHeader):expectedSize]
+			log.Printf("Method 0x%x: Read %d bytes of bytecode", methodHeader.ArtMethodPtr, len(bytecode))
+		} else {
+			log.Printf("Method event data size mismatch: expected %d, got %d", expectedSize, len(data))
+		}
 	}
 
 	parser := dexCache.GetParser(methodHeader.Begin)
@@ -403,12 +418,22 @@ func (dd *DexDumper) handleMethodEventRingBuf(CPU int, data []byte, perfMap *man
 
 	}
 
-	log.Printf("%s (pid=%d, dex=0x%x, method_idx=%d, art_method=0x%x)",
-		signature,
-		methodHeader.Pid,
-		methodHeader.Begin,
-		methodHeader.MethodIndex,
-		methodHeader.ArtMethodPtr)
+	if methodHeader.CodeitemSize > 0 {
+		log.Printf("%s (pid=%d, dex=0x%x, method_idx=%d, art_method=0x%x, bytecode_size=%d)",
+			signature,
+			methodHeader.Pid,
+			methodHeader.Begin,
+			methodHeader.MethodIndex,
+			methodHeader.ArtMethodPtr,
+			methodHeader.CodeitemSize)
+	} else {
+		log.Printf("%s (pid=%d, dex=0x%x, method_idx=%d, art_method=0x%x)",
+			signature,
+			methodHeader.Pid,
+			methodHeader.Begin,
+			methodHeader.MethodIndex,
+			methodHeader.ArtMethodPtr)
+	}
 }
 
 func main() {

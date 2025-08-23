@@ -7,7 +7,7 @@
 
 #define TASK_COMM_LEN 16
 #define MAX_ARGS_NUM 16
-
+#define MAX_PERCPU_BUFSIZE  (1 << 14)     // This value is actually set by the kernel as an upper bound
 
 struct config_t{
 	uid_t uid;
@@ -29,7 +29,14 @@ struct method_event_data_t {
     u64 art_method_ptr;
 
     u32 method_index;
+    u32 codeitem_size;
 };
+
+typedef struct simple_buf {
+    u8 buf[MAX_PERCPU_BUFSIZE];
+    u32 offset;
+} buf_t;
+
 
 
 // Events submission for dex file dumps using ringbuf
@@ -61,6 +68,25 @@ struct
     __type(key, u64);
     __type(value, u32);
 } dexFileCache_map SEC(".maps");
+
+// methodCodeCache map to track which methods have had their bytecode read
+struct
+{
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 100000);
+    __type(key, u64);
+    __type(value, u32);
+} methodCodeCache_map SEC(".maps");
+
+
+// Percpu global buffer variables
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, buf_t);
+} bufs_m SEC(".maps");
 
 
 #define INVALID_UID_PID ((uid_t)-1)

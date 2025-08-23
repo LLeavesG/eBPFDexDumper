@@ -12,6 +12,11 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type bpfBufT struct {
+	Buf    [16384]uint8
+	Offset uint32
+}
+
 type bpfConfigT struct {
 	Uid uint32
 	Pid int32
@@ -30,7 +35,7 @@ type bpfMethodEventDataT struct {
 	Thread       uint64
 	ArtMethodPtr uint64
 	MethodIndex  uint32
-	_            [4]byte
+	CodeitemSize uint32
 }
 
 // loadBpf returns the embedded CollectionSpec for bpf.
@@ -84,10 +89,12 @@ type bpfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
-	ConfigMap       *ebpf.MapSpec `ebpf:"config_map"`
-	DexFileCacheMap *ebpf.MapSpec `ebpf:"dexFileCache_map"`
-	Events          *ebpf.MapSpec `ebpf:"events"`
-	MethodEvents    *ebpf.MapSpec `ebpf:"method_events"`
+	BufsM              *ebpf.MapSpec `ebpf:"bufs_m"`
+	ConfigMap          *ebpf.MapSpec `ebpf:"config_map"`
+	DexFileCacheMap    *ebpf.MapSpec `ebpf:"dexFileCache_map"`
+	Events             *ebpf.MapSpec `ebpf:"events"`
+	MethodCodeCacheMap *ebpf.MapSpec `ebpf:"methodCodeCache_map"`
+	MethodEvents       *ebpf.MapSpec `ebpf:"method_events"`
 }
 
 // bpfObjects contains all objects after they have been loaded into the kernel.
@@ -109,17 +116,21 @@ func (o *bpfObjects) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
-	ConfigMap       *ebpf.Map `ebpf:"config_map"`
-	DexFileCacheMap *ebpf.Map `ebpf:"dexFileCache_map"`
-	Events          *ebpf.Map `ebpf:"events"`
-	MethodEvents    *ebpf.Map `ebpf:"method_events"`
+	BufsM              *ebpf.Map `ebpf:"bufs_m"`
+	ConfigMap          *ebpf.Map `ebpf:"config_map"`
+	DexFileCacheMap    *ebpf.Map `ebpf:"dexFileCache_map"`
+	Events             *ebpf.Map `ebpf:"events"`
+	MethodCodeCacheMap *ebpf.Map `ebpf:"methodCodeCache_map"`
+	MethodEvents       *ebpf.Map `ebpf:"method_events"`
 }
 
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
+		m.BufsM,
 		m.ConfigMap,
 		m.DexFileCacheMap,
 		m.Events,
+		m.MethodCodeCacheMap,
 		m.MethodEvents,
 	)
 }
