@@ -18,7 +18,10 @@ import "C"
 import (
 	"bytes"
 	"context"
+	"embed"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -47,17 +50,41 @@ type DexDumper struct {
 	libArtPath string
 	uid        uint32
 
-	mu             sync.RWMutex                 // 新增：缓存读写锁
-	methodSigCache map[uint64]map[uint32]string // 新增：Begin -> (methodIndex -> signature)
+	mu             sync.RWMutex                 // 读写锁，保护内部缓存
+	methodSigCache map[uint64]map[uint32]string // Begin -> (methodIndex -> signature)
+
+	// 记录dex文件大小，便于生成文件名 dex<begin>_<size>_code.json
+	dexSizes map[uint64]uint32 // Begin -> Size
+	// 累积每个dex的导出记录
+	methodRecords map[uint64][]MethodCodeRecord // Begin -> records
 }
 
-// Asset 简单的资产文件加载函数
+// JSON导出条目
+type MethodCodeRecord struct {
+	Name      string `json:"name"`
+	MethodIdx uint32 `json:"method_idx"`
+	CodeHex   string `json:"code"`
+}
+
+//go:embed assets/*.btf
+var embeddedAssets embed.FS
+
+// Asset 从内置资源或文件系统加载
 func Asset(filename string) ([]byte, error) {
+	// Try embedded assets first (support both with and without assets/ prefix)
+	if data, err := embeddedAssets.ReadFile(filename); err == nil {
+		return data, nil
+	}
+	if !strings.HasPrefix(filename, "assets/") {
+		if data, err := embeddedAssets.ReadFile("assets/" + filename); err == nil {
+			return data, nil
+		}
+	}
+	// Fallback to disk for dev/use outside embedding
 	return ioutil.ReadFile(filename)
 }
 
 func SetupManagerOptions() (manager.Options, error) {
-	// 对于没有开启 CONFIG_DEBUG_INFO_BTF 的加载额外的 btf.Spec
 	btfFile := ""
 	bpfManagerOptions := manager.Options{}
 
@@ -66,18 +93,14 @@ func SetupManagerOptions() (manager.Options, error) {
 	}
 
 	if btfFile != "" {
-		// 尝试从系统路径加载 BTF 文件
 		var byteBuf []byte
 		var err error
 
-		// 首先尝试从 assets 目录加载
 		byteBuf, err = Asset("assets/" + btfFile)
 		if err != nil {
-			// 如果 assets 目录不存在，尝试直接从文件系统加载
 			byteBuf, err = Asset(btfFile)
 			if err != nil {
 				log.Printf("Warning: Failed to load BTF file %s: %v", btfFile, err)
-				// 如果 BTF 文件加载失败，使用基本配置
 				return manager.Options{
 					RLimit: &unix.Rlimit{
 						Cur: unix.RLIM_INFINITY,
@@ -97,7 +120,7 @@ func SetupManagerOptions() (manager.Options, error) {
 				},
 			}, nil
 		}
-
+		log.Printf("[+] Loaded BTF spec from %s", btfFile)
 		bpfManagerOptions = manager.Options{
 			DefaultKProbeMaxActive: 512,
 			VerifierOptions: ebpf.CollectionOptions{
@@ -285,6 +308,8 @@ func (dd *DexDumper) Start(ctx context.Context) error {
 
 // Stop 停止 DexDumper
 func (dd *DexDumper) Stop() error {
+	log.Printf("Stopping eBPF DexDumper")
+	dd.flushJSON()
 	if dd.manager != nil {
 		return dd.manager.Stop(manager.CleanAll)
 	}
@@ -297,7 +322,9 @@ func NewDexDumper(libArtPath string, uid uint32, outputDir string) *DexDumper {
 	return &DexDumper{
 		libArtPath:     libArtPath,
 		uid:            uid,
-		methodSigCache: make(map[uint64]map[uint32]string), // 新增：初始化缓存
+		methodSigCache: make(map[uint64]map[uint32]string),
+		dexSizes:       make(map[uint64]uint32),
+		methodRecords:  make(map[uint64][]MethodCodeRecord),
 	}
 }
 
@@ -309,6 +336,11 @@ func (dd *DexDumper) handleDexEventRingBuf(CPU int, data []byte, ringBuf *manage
 		log.Printf("Read dex event failed: %s", err)
 		return
 	}
+
+	// 保存 dex 文件大小，供JSON导出文件名使用
+	dd.mu.Lock()
+	dd.dexSizes[dexHeader.Begin] = dexHeader.Size
+	dd.mu.Unlock()
 
 	// 读取 dex 文件数据
 	dexData := make([]byte, dexHeader.Size)
@@ -345,7 +377,7 @@ func (dd *DexDumper) handleDexEventRingBuf(CPU int, data []byte, ringBuf *manage
 		log.Printf("Failed to add dex file to cache: %v", err)
 	}
 
-	fileName := fmt.Sprintf("%s/dex_%x.dex", outputPath, dexHeader.Begin)
+	fileName := fmt.Sprintf("%s/dex_%x_%x.dex", outputPath, dexHeader.Begin, dexHeader.Size)
 	f, err := os.Create(fileName)
 	if err != nil {
 		log.Printf("Create file failed: %v", err)
@@ -377,12 +409,10 @@ func (dd *DexDumper) handleMethodEventRingBuf(CPU int, data []byte, perfMap *man
 	// Read bytecode if present
 	var bytecode []byte
 	if methodHeader.CodeitemSize > 0 {
-		expectedSize := int(unsafe.Sizeof(methodHeader)) + int(methodHeader.CodeitemSize)
-		if len(data) >= expectedSize {
-			bytecode = data[unsafe.Sizeof(methodHeader):expectedSize]
-			log.Printf("Method 0x%x: Read %d bytes of bytecode", methodHeader.ArtMethodPtr, len(bytecode))
-		} else {
-			log.Printf("Method event data size mismatch: expected %d, got %d", expectedSize, len(data))
+		bytecode = make([]byte, methodHeader.CodeitemSize)
+		if err := binary.Read(buf, binary.LittleEndian, &bytecode); err != nil {
+			log.Printf("Read method bytecode failed: %s", err)
+			return
 		}
 	}
 
@@ -401,6 +431,7 @@ func (dd *DexDumper) handleMethodEventRingBuf(CPU int, data []byte, perfMap *man
 	}
 	dd.mu.RUnlock()
 
+	var methodName string
 	if signature == "" {
 		methodInfo, err := parser.GetMethodInfo(methodHeader.MethodIndex)
 		if err != nil {
@@ -408,6 +439,7 @@ func (dd *DexDumper) handleMethodEventRingBuf(CPU int, data []byte, perfMap *man
 			return
 		}
 		signature = methodInfo.PrettyMethod()
+		methodName = signature
 
 		dd.mu.Lock()
 		if _, ok := dd.methodSigCache[methodHeader.Begin]; !ok {
@@ -416,6 +448,8 @@ func (dd *DexDumper) handleMethodEventRingBuf(CPU int, data []byte, perfMap *man
 		dd.methodSigCache[methodHeader.Begin][methodHeader.MethodIndex] = signature
 		dd.mu.Unlock()
 
+	} else {
+		methodName = signature
 	}
 
 	if methodHeader.CodeitemSize > 0 {
@@ -426,6 +460,18 @@ func (dd *DexDumper) handleMethodEventRingBuf(CPU int, data []byte, perfMap *man
 			methodHeader.MethodIndex,
 			methodHeader.ArtMethodPtr,
 			methodHeader.CodeitemSize)
+
+		// 记录到每个dex的JSON导出缓存
+		if len(bytecode) > 0 {
+			rec := MethodCodeRecord{
+				Name:      methodName,
+				MethodIdx: methodHeader.MethodIndex,
+				CodeHex:   hex.EncodeToString(bytecode),
+			}
+			dd.mu.Lock()
+			dd.methodRecords[methodHeader.Begin] = append(dd.methodRecords[methodHeader.Begin], rec)
+			dd.mu.Unlock()
+		}
 	} else {
 		log.Printf("%s (pid=%d, dex=0x%x, method_idx=%d, art_method=0x%x)",
 			signature,
@@ -433,6 +479,41 @@ func (dd *DexDumper) handleMethodEventRingBuf(CPU int, data []byte, perfMap *man
 			methodHeader.Begin,
 			methodHeader.MethodIndex,
 			methodHeader.ArtMethodPtr)
+	}
+}
+
+func (dd *DexDumper) flushJSON() {
+	dd.mu.RLock()
+	defer dd.mu.RUnlock()
+
+	for begin, records := range dd.methodRecords {
+		if len(records) == 0 {
+			continue
+		}
+
+		size := dd.dexSizes[begin]
+		// 如未记录size，尝试从缓存的parser获取
+		if size == 0 {
+			if p := dexCache.GetParser(begin); p != nil {
+				size = p.header.FileSize
+			}
+		}
+
+		fileName := fmt.Sprintf("%s/dex_%x_%x_code.json", outputPath, begin, size)
+		f, err := os.Create(fileName)
+		if err != nil {
+			log.Printf("Create JSON file failed: %v", err)
+			continue
+		}
+		defer f.Close()
+
+		enc := json.NewEncoder(f)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(records); err != nil {
+			log.Printf("Write JSON failed: %v", err)
+		} else {
+			log.Printf("Saved code records to %s (%d entries)", fileName, len(records))
+		}
 	}
 }
 
@@ -464,12 +545,20 @@ func main() {
 	defer cancel()
 
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, unix.SIGTERM)
+	signal.Notify(sigChan, os.Interrupt, unix.SIGTERM, unix.SIGHUP, unix.SIGQUIT)
+	defer signal.Stop(sigChan)
 
 	go func() {
-		<-sigChan
-		log.Println("Received stop signal, shutting down...")
-		cancel()
+		for {
+			select {
+			case sig := <-sigChan:
+				log.Printf("Received signal %v, flushing JSON and shutting down...", sig)
+				cancel()
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
 	}()
 
 	if err := dumper.Start(ctx); err != nil {
