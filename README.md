@@ -1,51 +1,85 @@
 # eBPF-DexDumper
-Android dexDumper based on eBPF
+Android in-memory DEX dumper powered by eBPF.
 
-* Undetectable
-* Passive dump
+- Undetectable
+- Passive dump
 
-Show: https://blog.lleavesg.top/article/eBPFDexDumper
+Showcase: https://blog.lleavesg.top/article/eBPFDexDumper
+
+## Supported Environment
+- Tested on Android 13 (Pixel 6)
+- Built for `arm64`
+
+Note: on other Android versions you may need minor adjustments and rebuild.
+
+Before dumping, it’s recommended to remove the app’s oat optimization output to avoid `cdex` or empty results. You can do this manually, or let the tool remove it automatically with `--clean-oat`:
+- Find base path: `pm path <package>`
+- Remove oat folder: delete the app’s `oat/` directory under `/data/app/.../<package>/`
+
+Root permission is typically required to attach uprobes and read target memory.
 
 ## Usage
 
-**Test Env: Android 13 Pixel6**
-
-**If other Android version , please fix the code and Compile.**
-
-**Delete `/data/app/xxxx/xxxx-packagename/oat` folder first(check by `pm path packagename`), used to delete oat optimization content, to avoid the inability to dump or dump out `cdex`, etc.**
-
+Top-level:
 ```
-Usage: ./eBPFDexDumper <uid> <pathToLibart> <offsetExecute(hex)> <offsetExecuteNterpImpl(hex)> <offsetVerifyClass(hex)> <outputPath>
-Example ( if Auto get offset ): ./eBPFDexDumper 10244 /apex/com.android.art/lib64/libart.so 0 0 0 /data/local/tmp/dexfile
-Example (if get offset failed): ./eBPFDexDumper 10244 /apex/com.android.art/lib64/libart.so 0x473E48 0x200090 0x3D9F18 /data/local/tmp/dexfile
+eBPFDexDumper [command] [options]
 ```
-**uid**: UID of App you want to dump
 
-**pathToLibart**: `libart.so` path, check by cat `/proc/<pid>/maps`
+Commands:
+- `dump`: Start eBPF-based DEX dumper
+- `fix`: Fix dumped DEX files in a directory
 
-**offsetExecute(hex)**: offset(hex) of `art::interpreter::Execute` in `libart.so`
+### dump
+Attach uprobes to libart and stream DEX/method events. You must provide either `--uid` or `--name` to filter the target app.
 
-**offsetExecuteNterpImpl(hex)**: offset(hex) of `ExecuteNterpImpl` in `libart.so`
+Options:
+- `--uid, -u <uid>`: Filter by UID (alternative to `--name`).
+- `--name, -n <package>`: Android package name to derive UID (alternative to `--uid`).
+- `--libart, -l <path>`: Path to `libart.so` on device. Default: `/apex/com.android.art/lib64/libart.so`.
+- `--out, -o, --output <dir>`: Output directory on device (required).
+- `--trace, -t`: Realtime print of executed methods during dumping (optional; off by default).
+- `--clean-oat, -c`: Remove `/data/app/.../oat` of the target app(s) before dumping (optional; off by default).
 
-**offsetVerifyClass(hex)**: offset(hex) of `art::verifier::ClassVerifier::VerifyClass` in `libart.so`
+Examples:
+```
+# Filter by UID
+./eBPFDexDumper dump -u 10244 -o /data/local/tmp/out
 
-**outputPath**: dumped dex file path
+# Filter by package name (UID auto-resolved)
+./eBPFDexDumper dump -n com.example.app -o /data/local/tmp/out
 
->By default, the symbols of libart.so will be parsed automatically.
-The three offsets can be filled in freely, but if they are not found, you need to specify them manually, so it is recommended to fill in all 0s or all the correct offsets.
+# Enable realtime method trace output
+./eBPFDexDumper dump -n com.example.app -o /data/local/tmp/out -t
 
-![image](https://github.com/user-attachments/assets/43e9d9ac-c56c-4dd7-9349-8d4fed1b6207)
-![image](https://github.com/user-attachments/assets/565d1761-baa2-42cc-99c6-47eae703fee1)
+# Custom libart path
+./eBPFDexDumper dump -u 10244 -l /apex/com.android.art/lib64/libart.so -o /sdcard/dex_out
 
+# Auto-remove oat to improve completeness
+./eBPFDexDumper dump -n com.example.app -o /data/local/tmp/out -c
+```
 
-## Compile
-fix ndk path and make
+Outputs:
+- DEX files: `dex_<begin>_<size>.dex` saved under the output directory.
+- Method bytecode JSON: `dex_<begin>_<size>_code.json` saved on shutdown (SIGINT/SIGTERM) or normal exit.
 
+### fix
+Scan a directory for dumped DEX files and fix headers/structures for readability.
+
+Options:
+- `--dir, -d <dir>`: Directory containing dumped DEX files (required).
+
+Example:
+```
+./eBPFDexDumper fix -d /data/local/tmp/out
+```
+
+## Build
+Adjust NDK path if necessary, then:
 ```
 make
 ```
 
-## Reference
+## References
 https://github.com/cilium/ebpf
 
 https://github.com/null-luo/btrace

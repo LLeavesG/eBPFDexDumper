@@ -12,25 +12,25 @@ import (
 
 // Dex文件格式常量
 const (
-	DEX_FILE_MAGIC = 0x0A786564
-	
-	// String类型定义
-	TYPE_BYTE   = 0x00
-	TYPE_SHORT  = 0x02
-	TYPE_CHAR   = 0x03
-	TYPE_INT    = 0x04
-	TYPE_LONG   = 0x06
-	TYPE_FLOAT  = 0x10
-	TYPE_DOUBLE = 0x11
-	TYPE_STRING = 0x17
-	TYPE_TYPE   = 0x18
-	TYPE_FIELD  = 0x19
-	TYPE_METHOD = 0x1a
-	TYPE_ENUM   = 0x1b
-	TYPE_ARRAY  = 0x1c
-	TYPE_CLASS  = 0x1f
-	TYPE_NULL   = 0x1e
-	TYPE_VOID   = 0x56
+    DexFileMagic = 0x0A786564
+
+    // String类型定义（保留以备后用）
+    TypeByte   = 0x00
+    TypeShort  = 0x02
+    TypeChar   = 0x03
+    TypeInt    = 0x04
+    TypeLong   = 0x06
+    TypeFloat  = 0x10
+    TypeDouble = 0x11
+    TypeString = 0x17
+    TypeType   = 0x18
+    TypeField  = 0x19
+    TypeMethod = 0x1a
+    TypeEnum   = 0x1b
+    TypeArray  = 0x1c
+    TypeClass  = 0x1f
+    TypeNull   = 0x1e
+    TypeVoid   = 0x56
 )
 
 // Dex文件头结构
@@ -116,9 +116,9 @@ func NewDexParser(data []byte) (*DexParser, error) {
 	
 	// 验证魔数
 	magic := binary.LittleEndian.Uint32(parser.header.Magic[:4])
-	if magic != DEX_FILE_MAGIC {
-		return nil, fmt.Errorf("invalid dex magic: %x", magic)
-	}
+    if magic != DexFileMagic {
+        return nil, fmt.Errorf("invalid dex magic: %x", magic)
+    }
 	
 	return parser, nil
 }
