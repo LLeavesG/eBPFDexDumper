@@ -22,6 +22,14 @@ type bpfConfigT struct {
 	Pid int32
 }
 
+type bpfDexChunkEventT struct {
+	Begin   uint64
+	Pid     uint32
+	Size    uint32
+	Offset  uint32
+	DataLen uint32
+}
+
 type bpfDexEventDataT struct {
 	Begin uint64
 	Pid   uint32
@@ -92,6 +100,8 @@ type bpfMapSpecs struct {
 	BufsM              *ebpf.MapSpec `ebpf:"bufs_m"`
 	ConfigMap          *ebpf.MapSpec `ebpf:"config_map"`
 	DexFileCacheMap    *ebpf.MapSpec `ebpf:"dexFileCache_map"`
+	DexProgressMap     *ebpf.MapSpec `ebpf:"dexProgress_map"`
+	DexChunks          *ebpf.MapSpec `ebpf:"dex_chunks"`
 	Events             *ebpf.MapSpec `ebpf:"events"`
 	MethodCodeCacheMap *ebpf.MapSpec `ebpf:"methodCodeCache_map"`
 	MethodEvents       *ebpf.MapSpec `ebpf:"method_events"`
@@ -119,6 +129,8 @@ type bpfMaps struct {
 	BufsM              *ebpf.Map `ebpf:"bufs_m"`
 	ConfigMap          *ebpf.Map `ebpf:"config_map"`
 	DexFileCacheMap    *ebpf.Map `ebpf:"dexFileCache_map"`
+	DexProgressMap     *ebpf.Map `ebpf:"dexProgress_map"`
+	DexChunks          *ebpf.Map `ebpf:"dex_chunks"`
 	Events             *ebpf.Map `ebpf:"events"`
 	MethodCodeCacheMap *ebpf.Map `ebpf:"methodCodeCache_map"`
 	MethodEvents       *ebpf.Map `ebpf:"method_events"`
@@ -129,6 +141,8 @@ func (m *bpfMaps) Close() error {
 		m.BufsM,
 		m.ConfigMap,
 		m.DexFileCacheMap,
+		m.DexProgressMap,
+		m.DexChunks,
 		m.Events,
 		m.MethodCodeCacheMap,
 		m.MethodEvents,

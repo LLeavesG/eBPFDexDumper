@@ -30,7 +30,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"time"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
@@ -56,6 +55,9 @@ type DexDumper struct {
 	// 记录dex文件大小，便于生成文件名 dex<begin>_<size>_code.json
 	dexSizes      map[uint64]uint32             // Begin -> Size
 	methodRecords map[uint64][]MethodCodeRecord // Begin -> records
+
+	// 分片接收状态：在Go侧重组eBPF分片
+	pendingDex map[uint64]*dexRecvState // Begin -> state
 }
 
 // JSON导出条目
@@ -224,6 +226,14 @@ func (dd *DexDumper) setupManager() error {
 					DataHandler: dd.handleMethodEventRingBuf,
 				},
 			},
+			{
+				Map: manager.Map{
+					Name: "dex_chunks",
+				},
+				RingbufMapOptions: manager.RingbufMapOptions{
+					DataHandler: dd.handleDexChunkEventRingBuf,
+				},
+			},
 		},
 	}
 
@@ -302,6 +312,7 @@ func NewDexDumper(libArtPath string, uid uint32, outputDir string, trace bool) *
 		methodSigCache: make(map[uint64]map[uint32]string),
 		dexSizes:       make(map[uint64]uint32),
 		methodRecords:  make(map[uint64][]MethodCodeRecord),
+		pendingDex:     make(map[uint64]*dexRecvState),
 	}
 }
 
@@ -319,55 +330,8 @@ func (dd *DexDumper) handleDexEventRingBuf(CPU int, data []byte, ringBuf *manage
 	dd.dexSizes[dexHeader.Begin] = dexHeader.Size
 	dd.mu.Unlock()
 
-	// 读取 dex 文件数据
-	dexData := make([]byte, dexHeader.Size)
-	nread, _ := C.readRemoteMem(
-		C.pid_t(dexHeader.Pid),
-		unsafe.Pointer(&dexData[0]),
-		C.size_t(len(dexData)),
-		unsafe.Pointer(uintptr(dexHeader.Begin)),
-	)
-	if nread < 0 {
-		log.Printf("process_vm_readv failed")
-		// retry
-		time.Sleep(1 * time.Second)
-		nread, _ = C.readRemoteMem(
-			C.pid_t(dexHeader.Pid),
-			unsafe.Pointer(&dexData[0]),
-			C.size_t(len(dexData)),
-			unsafe.Pointer(uintptr(dexHeader.Begin)),
-		)
-		if nread < 0 {
-			log.Printf("process_vm_readv failed again at Begin: %08x Size: %-10d", dexHeader.Begin, dexHeader.Size)
-
-			// 删除缓存项
-			dexCacheMap, found, err := dd.manager.GetMap("dexFileCache_map")
-			if err == nil && found {
-				dexCacheMap.Delete(uint64(dexHeader.Begin))
-			}
-			return
-		}
-	}
-
-	err := dexCache.AddDexFile(dexHeader.Begin, dexData)
-	if err != nil {
-		log.Printf("Failed to add dex file to cache: %v", err)
-	}
-
-	fileName := fmt.Sprintf("%s/dex_%x_%x.dex", outputPath, dexHeader.Begin, dexHeader.Size)
-	f, err := os.Create(fileName)
-	if err != nil {
-		log.Printf("Create file failed: %v", err)
-		return
-	}
-	defer f.Close()
-
-	_, err = f.Write(dexData)
-	if err != nil {
-		log.Printf("Write dexData failed: %v", err)
-		return
-	}
-	log.Printf("Dex file saved to %s, size %-10d\n", fileName, nread)
+	// eBPF层已开始分片发送，此处不再 process_vm_readv。
+	// 仅记录大小等元信息，等待 dex_chunks 重组完成。
 }
 
 func (dd *DexDumper) handleMethodEventRingBuf(CPU int, data []byte, perfMap *manager.RingbufMap, manager *manager.Manager) {
@@ -495,4 +459,80 @@ func (dd *DexDumper) flushJSON() {
 			log.Printf("Saved code records to %s (%d entries)", fileName, len(records))
 		}
 	}
+}
+
+// 接收状态结构：重组 eBPF 分片
+type dexRecvState struct {
+	total uint32
+	recv  uint32
+	buf   []byte
+}
+
+// 处理 eBPF 侧发来的 DEX 分片事件
+func (dd *DexDumper) handleDexChunkEventRingBuf(CPU int, data []byte, ringBuf *manager.RingbufMap, mgr *manager.Manager) {
+	if len(data) < int(unsafe.Sizeof(bpfDexChunkEventT{})) {
+		log.Printf("Dex chunk event too short: %d bytes", len(data))
+		return
+	}
+
+	buf := bytes.NewBuffer(data)
+	hdr := bpfDexChunkEventT{}
+	if err := binary.Read(buf, binary.LittleEndian, &hdr); err != nil {
+		log.Printf("Read dex chunk header failed: %s", err)
+		return
+	}
+
+	payload := make([]byte, hdr.DataLen)
+	if hdr.DataLen > 0 {
+		if err := binary.Read(buf, binary.LittleEndian, &payload); err != nil {
+			log.Printf("Read dex chunk payload failed: %s", err)
+			return
+		}
+	}
+
+	begin := hdr.Begin
+	dd.mu.Lock()
+	st, ok := dd.pendingDex[begin]
+	if !ok {
+		// init new state
+		st = &dexRecvState{total: hdr.Size, buf: make([]byte, hdr.Size)}
+		dd.pendingDex[begin] = st
+		// record size for later JSON name
+		dd.dexSizes[begin] = hdr.Size
+	}
+	// bounds check
+	if uint64(hdr.Offset)+uint64(hdr.DataLen) <= uint64(len(st.buf)) {
+		copy(st.buf[hdr.Offset:uint32(hdr.Offset)+hdr.DataLen], payload)
+		// update received length conservatively; allow duplicates
+		if st.recv < hdr.Offset+hdr.DataLen {
+			st.recv = hdr.Offset + hdr.DataLen
+		}
+	}
+
+	// completed?
+	if st.recv >= st.total {
+		dataCopy := st.buf
+		// finalize
+		delete(dd.pendingDex, begin)
+		dd.mu.Unlock()
+
+		if err := dexCache.AddDexFile(begin, dataCopy); err != nil {
+			log.Printf("Failed to add dex file to cache: %v", err)
+		}
+
+		fileName := fmt.Sprintf("%s/dex_%x_%x.dex", outputPath, begin, hdr.Size)
+		f, err := os.Create(fileName)
+		if err != nil {
+			log.Printf("Create file failed: %v", err)
+			return
+		}
+		defer f.Close()
+		if _, err := f.Write(dataCopy); err != nil {
+			log.Printf("Write dexData failed: %v", err)
+			return
+		}
+		log.Printf("Dex file saved to %s, size %d", fileName, len(dataCopy))
+		return
+	}
+	dd.mu.Unlock()
 }

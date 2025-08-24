@@ -5,6 +5,7 @@ const struct config_t *unused_config_t __attribute__((unused));
 const struct dex_event_data_t *unused_dex_event_data_t __attribute__((unused));
 const struct method_event_data_t *unused_method_event_data_t __attribute__((unused));
 const buf_t *unused_buf_t __attribute__((unused));
+const struct dex_chunk_event_t *unused_dex_chunk_event_t __attribute__((unused));
 
 static int config_loaded = 0;
 static bool filter_enable = false;
@@ -126,6 +127,79 @@ void submit_method_event_with_bytecode(u64 begin, u32 pid, u32 size, u64 art_met
     }
 }
 
+// Max chunks per invocation to control runtime
+#define MAX_CHUNKS_PER_CALL 64
+
+static __always_inline void submit_dex_chunks_partial(u64 begin, u32 pid, u32 size) {
+    if (size == 0) return;
+
+    // load current progress
+    u32 *pnext = (u32 *)bpf_map_lookup_elem(&dexProgress_map, &begin);
+    u32 next_off = 0;
+    if (pnext) {
+        next_off = *pnext;
+        if (next_off >= size) {
+            return; // completed
+        }
+    }
+
+    // compute max payload per record
+    const u32 hdr_sz = sizeof(struct dex_chunk_event_t);
+    const u32 max_payload = MAX_PERCPU_BUFSIZE - hdr_sz;
+
+    #pragma unroll
+    for (int i = 0; i < MAX_CHUNKS_PER_CALL; i++) {
+        if (next_off >= size) {
+            break;
+        }
+
+        u32 remain = size > next_off ? size - next_off : 0;
+        if (remain == 0) {
+            break;
+        }
+        u32 payload = remain;
+        if (payload > max_payload) {
+            payload = max_payload;
+        }
+        // ensure non-negative and 32-bit clean for helper
+        payload &= 0x7fffffff;
+
+        // Reserve fixed-size space in ringbuf (use constant size for verifier)
+        struct dex_chunk_event_t *evt = (struct dex_chunk_event_t *)bpf_ringbuf_reserve(&dex_chunks, MAX_PERCPU_BUFSIZE, 0);
+        if (!evt) {
+            // Failed to reserve, stop processing
+            break;
+        }
+
+        // Fill the event header
+        evt->begin = begin;
+        evt->pid = pid;
+        evt->size = size;
+        evt->offset = next_off;
+        evt->data_len = payload;
+
+        // read user memory into buffer after header
+        u32 read_size = payload;
+        asm volatile("if %[size] < %[max] goto +1;\n"
+                     "%[size] = %[max];\n"
+                     : [size] "+r"(read_size)
+                     : [max] "i"(max_payload));
+        if (bpf_probe_read_user((void *)((char *)evt + sizeof(*evt)), read_size, (void *)(begin + next_off)) != 0) {
+            // On failure, discard the reserved space and stop
+            bpf_ringbuf_discard(evt, 0);
+            break;
+        }
+
+        // Submit the filled event
+        bpf_ringbuf_submit(evt, 0);
+
+        next_off += payload;
+    }
+
+    // store progress
+    bpf_map_update_elem(&dexProgress_map, &begin, &next_off, BPF_ANY);
+}
+
 static __always_inline
 bool trace_allowed(u32 pid, u32 uid)
 {   
@@ -211,6 +285,9 @@ int uprobe_libart_execute(struct pt_regs *ctx)
         u32 codeitem_size = 0;
         read_method_bytecode(art_method_ptr, &codeitem_size);
         submit_method_event_with_bytecode(begin, pid, size, art_method_ptr, dex_method_index, codeitem_size);
+
+        // submit dex chunks progressively via ringbuf
+        submit_dex_chunks_partial(begin, pid, size);
     }
 
     return 0;
@@ -271,6 +348,9 @@ int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
         u32 codeitem_size = 0;
         read_method_bytecode(art_method_ptr, &codeitem_size);
         submit_method_event_with_bytecode(begin, pid, size, art_method_ptr, dex_method_index, codeitem_size);
+
+        // submit dex chunks progressively via ringbuf
+        submit_dex_chunks_partial(begin, pid, size);
     }
     return 0;
 }
@@ -326,6 +406,9 @@ int uprobe_libart_nterpOpInvoke(struct pt_regs *ctx)
         u32 codeitem_size = 0;
         read_method_bytecode(art_method_ptr, &codeitem_size);
         submit_method_event_with_bytecode(begin, pid, size, art_method_ptr, dex_method_index, codeitem_size);
+
+        // submit dex chunks progressively via ringbuf
+        submit_dex_chunks_partial(begin, pid, size);
     }
     return 0;
 }
@@ -371,6 +454,9 @@ int uprobe_libart_verifyClass(struct pt_regs *ctx)
             bpf_ringbuf_submit(evt_ptr, 0);
         }
         bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
+
+        // submit dex chunks progressively via ringbuf
+        submit_dex_chunks_partial(begin, pid, size);
     }
     return 0;
 }

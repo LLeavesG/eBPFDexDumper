@@ -8,7 +8,7 @@ PACKAGE = main
 BPF_FILE = bpf.c
 
 # TYPE = -type trace_event -type trace_config
-TYPE = -type config_t -type dex_event_data_t -type method_event_data_t
+TYPE = -type config_t -type dex_event_data_t -type dex_chunk_event_t -type method_event_data_t
 
 HEADERS = headers
 VMLINUX_HEADERS = vmlinux/$(TARGET)

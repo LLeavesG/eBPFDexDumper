@@ -20,6 +20,15 @@ struct dex_event_data_t {
     u32 size;
 };
 
+// Chunked dex data event header (variable-length payload follows)
+struct dex_chunk_event_t {
+    u64 begin;       // dex begin address in target process
+    u32 pid;         // target pid
+    u32 size;        // total dex size
+    u32 offset;      // chunk offset in dex
+    u32 data_len;    // payload size of this chunk
+};
+
 struct method_event_data_t {
     u64 begin;
     u32 pid;
@@ -50,6 +59,12 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 24);
 } method_events SEC(".maps");
+
+// Chunked dex data ring buffer
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 24);
+} dex_chunks SEC(".maps");
 
 // Config map
 struct
@@ -87,6 +102,15 @@ struct {
     __type(key, u32);
     __type(value, buf_t);
 } bufs_m SEC(".maps");
+
+// dex progress map: begin -> next_offset to send
+struct
+{
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, u64);
+    __type(value, u32);
+} dexProgress_map SEC(".maps");
 
 
 #define INVALID_UID_PID ((uid_t)-1)
