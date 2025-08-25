@@ -7,6 +7,7 @@ const struct dex_event_data_t *unused_dex_event_data_t __attribute__((unused));
 const struct method_event_data_t *unused_method_event_data_t __attribute__((unused));
 const buf_t *unused_buf_t __attribute__((unused));
 const struct dex_chunk_event_t *unused_dex_chunk_event_t __attribute__((unused));
+const struct dex_read_failure_t *unused_dex_read_failure_t __attribute__((unused));
 
 static int config_loaded = 0;
 static bool filter_enable = false;
@@ -152,7 +153,7 @@ static __always_inline void submit_dex_chunks_partial(u64 begin, u32 pid, u32 si
 
     // compute max payload per record
     const u32 hdr_sz = sizeof(struct dex_chunk_event_t);
-    const u32 max_payload = MAX_PERCPU_BUFSIZE - hdr_sz;
+    const u32 max_payload = RINGBUF_SIZE - hdr_sz;
 
     #pragma unroll
     for (int i = 0; i < MAX_CHUNKS_PER_CALL; i++) {
@@ -168,13 +169,20 @@ static __always_inline void submit_dex_chunks_partial(u64 begin, u32 pid, u32 si
         if (payload > max_payload) {
             payload = max_payload;
         }
-        // ensure non-negative and 32-bit clean for helper
-        payload &= 0x7fffffff;
 
         // Reserve fixed-size space in ringbuf (use constant size for verifier)
-        struct dex_chunk_event_t *evt = (struct dex_chunk_event_t *)bpf_ringbuf_reserve(&dex_chunks, MAX_PERCPU_BUFSIZE, 0);
+        struct dex_chunk_event_t *evt = (struct dex_chunk_event_t *)bpf_ringbuf_reserve(&dex_chunks, RINGBUF_SIZE, 0);
         if (!evt) {
             // Failed to reserve, stop processing
+            // Notify go side about read failure - use readRemoteMem as fallback
+            struct dex_read_failure_t *failure_evt = (struct dex_read_failure_t *)bpf_ringbuf_reserve(&read_failures, sizeof(struct dex_read_failure_t), 0);
+            if (failure_evt) {
+                failure_evt->begin = begin;
+                failure_evt->pid = pid;
+                failure_evt->size = size;
+                failure_evt->failed_offset = next_off;
+                bpf_ringbuf_submit(failure_evt, BPF_RB_FORCE_WAKEUP);
+            }
             break;
         }
 
@@ -191,9 +199,19 @@ static __always_inline void submit_dex_chunks_partial(u64 begin, u32 pid, u32 si
                      "%[size] = %[max];\n"
                      : [size] "+r"(read_size)
                      : [max] "i"(max_payload));
-        if (bpf_probe_read_user((void *)((char *)evt + sizeof(*evt)), read_size, (void *)(begin + next_off)) != 0) {
-            // On failure, discard the reserved space and stop
+        int ret = bpf_probe_read_user((void *)((char *)evt + sizeof(*evt)), read_size, (void *)(begin + next_off));
+        if (ret != 0) {
             bpf_ringbuf_discard(evt, 0);
+            // Notify go side about read failure - use readRemoteMem as fallback
+            struct dex_read_failure_t *failure_evt = (struct dex_read_failure_t *)bpf_ringbuf_reserve(&read_failures, sizeof(struct dex_read_failure_t), 0);
+            if (failure_evt) {
+                failure_evt->begin = begin;
+                failure_evt->pid = pid;
+                failure_evt->size = size;
+                failure_evt->failed_offset = next_off;
+                bpf_ringbuf_submit(failure_evt, BPF_RB_FORCE_WAKEUP);
+            }
+            
             break;
         }
 
@@ -263,34 +281,35 @@ int uprobe_libart_execute(struct pt_regs *ctx)
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
     bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
 
+    // read one byte to check if readable
+    bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
 
     if(begin != 0 && size != 0) {
-        // bpf_printk("begin: %llx size: %x", begin, size);
         if (size < 0){
             return 0;
         }
 
-        u32 exist = 1;
-        u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
+        if (ch == 0x64) {
+            u32 exist = 1;
+            u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
 
-        if (value == 0 || *value != 1){
-            struct dex_event_data_t *dex_evt = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
-            if (dex_evt) {
-                dex_evt->begin = begin;
-                dex_evt->pid = pid;
-                dex_evt->size = size;
-                bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
+            if (value == 0 || *value != 1){
+                struct dex_event_data_t *dex_evt = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
+                if (dex_evt) {
+                    dex_evt->begin = begin;
+                    dex_evt->pid = pid;
+                    dex_evt->size = size;
+                    bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
+                }
+                // submit dex chunks progressively via ringbuf
+                submit_dex_chunks_partial(begin, pid, size);
+                bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
             }
-            // submit dex chunks progressively via ringbuf
-            submit_dex_chunks_partial(begin, pid, size);
-            
-            bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
         }
 
         u32 codeitem_size = 0;
         read_method_bytecode(art_method_ptr, &codeitem_size);
         submit_method_event_with_bytecode(begin, pid, size, art_method_ptr, dex_method_index, codeitem_size);
-        bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
     }
 
     return 0;
@@ -322,40 +341,39 @@ int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
 
     u64 begin = 0;
     u32 size = 0;
+    u8 ch = 0;
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
     bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
-    if (begin == 0x75e5f51000) {
-        bpf_printk("hit");
-        bpf_printk("dex file begin: %llx size: %llx", begin, size);
-    }
+
+    // read one byte to check if readable
+    bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
 
     if(begin != 0 && size != 0) {
         if (size < 0){
             return 0;
         }
 
-        u32 exist = 1;
-        u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
+        if (ch == 0x64) {
+            u32 exist = 1;
+            u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
 
-        if (value == 0 || *value != 1){
-
-            struct dex_event_data_t *dex_evt = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
-            if (dex_evt) {
-                dex_evt->begin = begin;
-                dex_evt->pid = pid;
-                dex_evt->size = size;
-                bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
+            if (value == 0 || *value != 1){
+                struct dex_event_data_t *dex_evt = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
+                if (dex_evt) {
+                    dex_evt->begin = begin;
+                    dex_evt->pid = pid;
+                    dex_evt->size = size;
+                    bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
+                }
+                // submit dex chunks progressively via ringbuf
+                submit_dex_chunks_partial(begin, pid, size);
+                bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
             }
-            // submit dex chunks progressively via ringbuf
-            submit_dex_chunks_partial(begin, pid, size);
-            bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
         }
 
-        // read codeitem
         u32 codeitem_size = 0;
         read_method_bytecode(art_method_ptr, &codeitem_size);
         submit_method_event_with_bytecode(begin, pid, size, art_method_ptr, dex_method_index, codeitem_size);
-
     }
     return 0;
 }
@@ -387,28 +405,33 @@ int uprobe_libart_nterpOpInvoke(struct pt_regs *ctx)
     
     u64 begin = 0;
     u32 size = 0;
+    u8 ch = 0;
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
     bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
-    bpf_printk("dex file begin: %llx size: %llx", begin, size);
+    // read one byte to check if readable
+    bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
+
     if(begin != 0 && size != 0) {
         if (size < 0){
             return 0;
         }
 
-        u32 exist = 1;
-        u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
+        if (ch == 0x64) {
+            u32 exist = 1;
+            u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
 
-        if (value == 0 || *value != 1){
-            struct dex_event_data_t *dex_evt = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
-            if (dex_evt) {
-                dex_evt->begin = begin;
-                dex_evt->pid = pid;
-                dex_evt->size = size;
-                bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
+            if (value == 0 || *value != 1){
+                struct dex_event_data_t *dex_evt = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
+                if (dex_evt) {
+                    dex_evt->begin = begin;
+                    dex_evt->pid = pid;
+                    dex_evt->size = size;
+                    bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
+                }
+                // submit dex chunks progressively via ringbuf
+                submit_dex_chunks_partial(begin, pid, size);
+                bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
             }
-            // submit dex chunks progressively via ringbuf
-            submit_dex_chunks_partial(begin, pid, size);
-            bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
         }
 
         u32 codeitem_size = 0;
@@ -439,7 +462,6 @@ int uprobe_libart_verifyClass(struct pt_regs *ctx)
     bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
 
     if(begin != 0 && size != 0) {
-        // bpf_printk("begin: %llx size: %x", begin, size);
         if (size < 0){
             return 0;
         }
@@ -448,7 +470,6 @@ int uprobe_libart_verifyClass(struct pt_regs *ctx)
         u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
 
         if (value != 0 && *value == 1){
-            // bpf_printk("exist begin %x, size: %x exist %d", begin, size, *value);
             return 0;
         }
 

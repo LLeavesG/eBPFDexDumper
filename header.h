@@ -9,6 +9,8 @@
 #define MAX_ARGS_NUM 16
 #define MAX_PERCPU_BUFSIZE  (1 << 14)     // This value is actually set by the kernel as an upper bound
 
+#define RINGBUF_SIZE (1 << 18)   // 256KB per chunk event
+
 struct config_t{
 	uid_t uid;
 	pid_t pid;
@@ -41,6 +43,14 @@ struct method_event_data_t {
     u32 codeitem_size;
 };
 
+// Event for notifying read failures - go should use readRemoteMem
+struct dex_read_failure_t {
+    u64 begin;       // failed dex begin address
+    u32 pid;         // target pid  
+    u32 size;        // total dex size
+    u32 failed_offset; // offset where read failed
+};
+
 typedef struct simple_buf {
     u8 buf[MAX_PERCPU_BUFSIZE];
     u32 offset;
@@ -65,6 +75,12 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 24);
 } dex_chunks SEC(".maps");
+
+// Ring buffer for dex read failure notifications
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20);
+} read_failures SEC(".maps");
 
 // Config map
 struct

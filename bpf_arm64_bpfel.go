@@ -36,6 +36,14 @@ type bpfDexEventDataT struct {
 	Size  uint32
 }
 
+type bpfDexReadFailureT struct {
+	Begin        uint64
+	Pid          uint32
+	Size         uint32
+	FailedOffset uint32
+	_            [4]byte
+}
+
 type bpfMethodEventDataT struct {
 	Begin        uint64
 	Pid          uint32
@@ -105,6 +113,7 @@ type bpfMapSpecs struct {
 	Events             *ebpf.MapSpec `ebpf:"events"`
 	MethodCodeCacheMap *ebpf.MapSpec `ebpf:"methodCodeCache_map"`
 	MethodEvents       *ebpf.MapSpec `ebpf:"method_events"`
+	ReadFailures       *ebpf.MapSpec `ebpf:"read_failures"`
 }
 
 // bpfObjects contains all objects after they have been loaded into the kernel.
@@ -134,6 +143,7 @@ type bpfMaps struct {
 	Events             *ebpf.Map `ebpf:"events"`
 	MethodCodeCacheMap *ebpf.Map `ebpf:"methodCodeCache_map"`
 	MethodEvents       *ebpf.Map `ebpf:"method_events"`
+	ReadFailures       *ebpf.Map `ebpf:"read_failures"`
 }
 
 func (m *bpfMaps) Close() error {
@@ -146,6 +156,7 @@ func (m *bpfMaps) Close() error {
 		m.Events,
 		m.MethodCodeCacheMap,
 		m.MethodEvents,
+		m.ReadFailures,
 	)
 }
 
