@@ -69,6 +69,8 @@ OPTIONS:
 					&cli.StringFlag{Name: "out", Aliases: []string{"o", "output"}, Usage: "Output directory on device", Required: true},
 					&cli.BoolFlag{Name: "trace", Aliases: []string{"t"}, Usage: "Print executed methods in real time during dumping"},
 					&cli.BoolFlag{Name: "clean-oat", Aliases: []string{"c"}, Usage: "Remove /data/app/.../oat folders of target app(s) before dumping"},
+					&cli.Uint64Flag{Name: "execute-offset", Usage: "Manual offset for art::interpreter::Execute function (hex value, e.g. 0x12345)"},
+					&cli.Uint64Flag{Name: "nterp-offset", Usage: "Manual offset for ExecuteNterpImpl function (hex value, e.g. 0x12345)"},
 				},
 				Action: func(c *cli.Context) error {
 					uid := uint32(c.Uint64("uid"))
@@ -77,6 +79,8 @@ OPTIONS:
 					outputDir := c.String("out")
 					trace := c.Bool("trace")
 					cleanOat := c.Bool("clean-oat")
+					executeOffset := c.Uint64("execute-offset")
+					nterpOffset := c.Uint64("nterp-offset")
 
 					if err := os.MkdirAll(outputDir, 0755); err != nil {
 						return fmt.Errorf("failed to create output directory %s: %w", outputDir, err)
@@ -104,7 +108,7 @@ OPTIONS:
 						}
 					}
 
-					dumper := NewDexDumper(libArtPath, uid, outputDir, trace)
+					dumper := NewDexDumper(libArtPath, uid, outputDir, trace, executeOffset, nterpOffset)
 
 					ctx, cancel := context.WithCancel(context.Background())
 					defer cancel()

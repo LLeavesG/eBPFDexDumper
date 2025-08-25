@@ -342,7 +342,18 @@ func parseLibArt(path string) map[string]uint64 {
 // - art::interpreter::Execute
 // - ExecuteNterpImpl (by symbol, or by byte signature fallback)
 // - art::verifier::ClassVerifier::VerifyClass
-func FindArtOffsets(libArtPath string) (offsetExecute, offsetExecuteNterp, offsetVerifyClass uint64, err error) {
+// manualExecuteOffset and manualNterpOffset are optional manual overrides (use 0 to auto-detect)
+func FindArtOffsets(libArtPath string, manualExecuteOffset, manualNterpOffset uint64) (offsetExecute, offsetExecuteNterp, offsetVerifyClass uint64, err error) {
+	// Use manual offsets if provided
+	if manualExecuteOffset != 0 {
+		offsetExecute = manualExecuteOffset
+		log.Printf("[+] Using manual Execute offset: 0x%x", offsetExecute)
+	}
+	if manualNterpOffset != 0 {
+		offsetExecuteNterp = manualNterpOffset
+		log.Printf("[+] Using manual ExecuteNterpImpl offset: 0x%x", offsetExecuteNterp)
+	}
+
 	symMap := parseLibArt(libArtPath)
 
 	for name, off := range symMap {
@@ -356,6 +367,8 @@ func FindArtOffsets(libArtPath string) (offsetExecute, offsetExecuteNterp, offse
 			offsetExecuteNterp = off
 			continue
 		}
+
+		// FIXED: REMOVE VerifyClass
 		// art::verifier::ClassVerifier::VerifyClass
 		if offsetVerifyClass == 0 && strings.Contains(name, "3art") && strings.Contains(name, "8verifier") && strings.Contains(name, "13ClassVerifier") && strings.Contains(name, "11VerifyClass") {
 			offsetVerifyClass = off

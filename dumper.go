@@ -44,10 +44,12 @@ type methodEventHeader = bpfMethodEventDataT
 var outputPath string
 
 type DexDumper struct {
-	manager    *manager.Manager
-	libArtPath string
-	uid        uint32
-	trace      bool
+	manager       *manager.Manager
+	libArtPath    string
+	uid           uint32
+	trace         bool
+	executeOffset uint64
+	nterpOffset   uint64
 
 	mu             sync.RWMutex                 // 读写锁，保护内部缓存
 	methodSigCache map[uint64]map[uint32]string // Begin -> (methodIndex -> signature)
@@ -153,7 +155,7 @@ func SetupManagerOptions() (manager.Options, error) {
 }
 
 func (dd *DexDumper) setupManager() error {
-	offsetExecute, offsetExecuteNterp, offsetVerifyClass, err := FindArtOffsets(dd.libArtPath)
+	offsetExecute, offsetExecuteNterp, offsetVerifyClass, err := FindArtOffsets(dd.libArtPath, dd.executeOffset, dd.nterpOffset)
 	if err != nil {
 		return err
 	}
@@ -302,13 +304,15 @@ func (dd *DexDumper) Stop() error {
 	return nil
 }
 
-func NewDexDumper(libArtPath string, uid uint32, outputDir string, trace bool) *DexDumper {
+func NewDexDumper(libArtPath string, uid uint32, outputDir string, trace bool, executeOffset, nterpOffset uint64) *DexDumper {
 	outputPath = outputDir
 
 	return &DexDumper{
 		libArtPath:     libArtPath,
 		uid:            uid,
 		trace:          trace,
+		executeOffset:  executeOffset,
+		nterpOffset:    nterpOffset,
 		methodSigCache: make(map[uint64]map[uint32]string),
 		dexSizes:       make(map[uint64]uint32),
 		methodRecords:  make(map[uint64][]MethodCodeRecord),

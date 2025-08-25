@@ -22,6 +22,12 @@ static __always_inline bool filter_art(u64 artmethod) {
     return (artmethod & 0xFFFFFFFF00000000) == 0;
 }
 
+static __always_inline void* untag(void* ptr)
+{
+    void* tmp = (void*)((long)(ptr)&0x00ffffffffffffff);
+    return tmp;
+}
+
 static __always_inline 
 u32 read_method_bytecode(u64 art_method_ptr, u32 *codeitem_size) {
     *codeitem_size = 0;
@@ -236,7 +242,6 @@ int uprobe_libart_execute(struct pt_regs *ctx)
 
     u64 art_method_ptr = 0;
     bpf_probe_read_user(&art_method_ptr, sizeof(u64), shadow_frame_ptr + 8);
-    // bpf_printk("art_method_ptr: %llx", art_method_ptr);
     if (filter_art(art_method_ptr)) return 0;
 
     u32 dex_method_index = 0;
@@ -244,21 +249,20 @@ int uprobe_libart_execute(struct pt_regs *ctx)
 
     unsigned char *declaring_class_ptr = 0;
     bpf_probe_read_user(&declaring_class_ptr, sizeof(u32), (void *)art_method_ptr);
-    // bpf_printk("declaring_class_ptr: %llx", declaring_class_ptr);
 
     unsigned char *dex_cache_ptr = 0;
     bpf_probe_read_user(&dex_cache_ptr, sizeof(u64), declaring_class_ptr + 0x10);
-    // bpf_printk("dex_cache_ptr: %llx", dex_cache_ptr);
 
     unsigned char *dex_file_ptr = 0;
     bpf_probe_read_user(&dex_file_ptr, sizeof(u64), dex_cache_ptr + 0x10);
-    // bpf_printk("dex_file_ptr: %llx", dex_file_ptr);
+    dex_file_ptr = (unsigned char *)untag(dex_file_ptr);
     
     u64 begin = 0;
     u32 size = 0;
     u8 ch = 0;
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
-    bpf_probe_read_user(&size, sizeof(u32), dex_file_ptr + 0x10);
+    bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
+
 
     if(begin != 0 && size != 0) {
         // bpf_printk("begin: %llx size: %x", begin, size);
@@ -269,28 +273,24 @@ int uprobe_libart_execute(struct pt_regs *ctx)
         u32 exist = 1;
         u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
 
-        if (value != 0 && *value == 1){
-            // bpf_printk("exist begin %x, size: %x exist %d", begin, size, *value);
-            return 0;
+        if (value == 0 || *value != 1){
+            struct dex_event_data_t *dex_evt = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
+            if (dex_evt) {
+                dex_evt->begin = begin;
+                dex_evt->pid = pid;
+                dex_evt->size = size;
+                bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
+            }
+            // submit dex chunks progressively via ringbuf
+            submit_dex_chunks_partial(begin, pid, size);
+            
+            bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
         }
-        
-        struct dex_event_data_t *evt_ptr = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
-        if (evt_ptr) {
-            evt_ptr->begin = begin;
-            evt_ptr->pid = pid;
-            evt_ptr->size = size;
-            bpf_ringbuf_submit(evt_ptr, BPF_RB_FORCE_WAKEUP);
-        }
-        bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
-
-        // submit dex chunks progressively via ringbuf
-        submit_dex_chunks_partial(begin, pid, size);
 
         u32 codeitem_size = 0;
         read_method_bytecode(art_method_ptr, &codeitem_size);
         submit_method_event_with_bytecode(begin, pid, size, art_method_ptr, dex_method_index, codeitem_size);
-
-
+        bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
     }
 
     return 0;
@@ -307,7 +307,6 @@ int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
     u64 art_method_ptr = (u64)PT_REGS_PARM1(ctx);
     if (filter_art(art_method_ptr)) return 0;
 
-    // 读取ArtMethod中的dex_method_index (偏移量0x08)
     u32 dex_method_index = 0;
     bpf_probe_read_user(&dex_method_index, sizeof(u32), (void *)(art_method_ptr + 0x08));
 
@@ -319,23 +318,27 @@ int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
 
     unsigned char *dex_file_ptr = 0;
     bpf_probe_read_user(&dex_file_ptr, sizeof(u64), dex_cache_ptr + 0x10);
-    
+    dex_file_ptr = (unsigned char *)untag(dex_file_ptr);
+
     u64 begin = 0;
     u32 size = 0;
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
-    bpf_probe_read_user(&size, sizeof(u32), dex_file_ptr + 0x10);
+    bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
+    if (begin == 0x75e5f51000) {
+        bpf_printk("hit");
+        bpf_printk("dex file begin: %llx size: %llx", begin, size);
+    }
 
     if(begin != 0 && size != 0) {
         if (size < 0){
             return 0;
         }
 
-        // 首先检查并处理Dex文件缓存
         u32 exist = 1;
         u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
 
         if (value == 0 || *value != 1){
-            // Dex文件未缓存，发送Dex文件事件
+
             struct dex_event_data_t *dex_evt = (struct dex_event_data_t *)bpf_ringbuf_reserve(&events, sizeof(struct dex_event_data_t), 0);
             if (dex_evt) {
                 dex_evt->begin = begin;
@@ -343,11 +346,10 @@ int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
                 dex_evt->size = size;
                 bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
             }
+            // submit dex chunks progressively via ringbuf
+            submit_dex_chunks_partial(begin, pid, size);
             bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
         }
-
-        // submit dex chunks progressively via ringbuf
-        submit_dex_chunks_partial(begin, pid, size);
 
         // read codeitem
         u32 codeitem_size = 0;
@@ -381,12 +383,13 @@ int uprobe_libart_nterpOpInvoke(struct pt_regs *ctx)
 
     unsigned char *dex_file_ptr = 0;
     bpf_probe_read_user(&dex_file_ptr, sizeof(u64), dex_cache_ptr + 0x10);
+    dex_file_ptr = (unsigned char *)untag(dex_file_ptr);
     
     u64 begin = 0;
     u32 size = 0;
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
-    bpf_probe_read_user(&size, sizeof(u32), dex_file_ptr + 0x10);
-
+    bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
+    bpf_printk("dex file begin: %llx size: %llx", begin, size);
     if(begin != 0 && size != 0) {
         if (size < 0){
             return 0;
@@ -403,11 +406,10 @@ int uprobe_libart_nterpOpInvoke(struct pt_regs *ctx)
                 dex_evt->size = size;
                 bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
             }
+            // submit dex chunks progressively via ringbuf
+            submit_dex_chunks_partial(begin, pid, size);
             bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
         }
-
-        // submit dex chunks progressively via ringbuf
-        submit_dex_chunks_partial(begin, pid, size);
 
         u32 codeitem_size = 0;
         read_method_bytecode(art_method_ptr, &codeitem_size);
@@ -428,12 +430,13 @@ int uprobe_libart_verifyClass(struct pt_regs *ctx)
     struct dex_event_data_t evt = {};
     __builtin_memset(&evt, 0, sizeof(evt)); 
     unsigned char *dex_file_ptr = (unsigned char *)PT_REGS_PARM3(ctx);
+    dex_file_ptr = (unsigned char *)untag(dex_file_ptr);
     
     u64 begin = 0;
     u32 size = 0;
     u8 ch = 0;
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
-    bpf_probe_read_user(&size, sizeof(u32), dex_file_ptr + 0x10);
+    bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
 
     if(begin != 0 && size != 0) {
         // bpf_printk("begin: %llx size: %x", begin, size);
