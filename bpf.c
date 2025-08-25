@@ -1,5 +1,6 @@
 //go:build ignore
 #include "header.h"
+#include "vmlinux.h"
 
 const struct config_t *unused_config_t __attribute__((unused));
 const struct dex_event_data_t *unused_dex_event_data_t __attribute__((unused));
@@ -111,7 +112,7 @@ void submit_method_event_with_bytecode(u64 begin, u32 pid, u32 size, u64 art_met
         "%[size] = %[max];\n"
         :
         : [size] "r"(total_size), [max] "i"(MAX_PERCPU_BUFSIZE));
-        bpf_ringbuf_output(&method_events, buf->buf, total_size, 0);
+        bpf_ringbuf_output(&method_events, buf->buf, total_size, BPF_RB_FORCE_WAKEUP);
     } else {
         // Submit without bytecode using fixed-size structure
         struct method_event_data_t *method_evt = (struct method_event_data_t *)bpf_ringbuf_reserve(&method_events, sizeof(struct method_event_data_t), 0);
@@ -122,7 +123,7 @@ void submit_method_event_with_bytecode(u64 begin, u32 pid, u32 size, u64 art_met
             method_evt->art_method_ptr = art_method_ptr;
             method_evt->method_index = method_index;
             method_evt->codeitem_size = 0;
-            bpf_ringbuf_submit(method_evt, 0);
+            bpf_ringbuf_submit(method_evt, BPF_RB_FORCE_WAKEUP);
         }
     }
 }
@@ -191,7 +192,7 @@ static __always_inline void submit_dex_chunks_partial(u64 begin, u32 pid, u32 si
         }
 
         // Submit the filled event
-        bpf_ringbuf_submit(evt, 0);
+        bpf_ringbuf_submit(evt, BPF_RB_FORCE_WAKEUP);
 
         next_off += payload;
     }
@@ -278,16 +279,18 @@ int uprobe_libart_execute(struct pt_regs *ctx)
             evt_ptr->begin = begin;
             evt_ptr->pid = pid;
             evt_ptr->size = size;
-            bpf_ringbuf_submit(evt_ptr, 0);
+            bpf_ringbuf_submit(evt_ptr, BPF_RB_FORCE_WAKEUP);
         }
         bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
+
+        // submit dex chunks progressively via ringbuf
+        submit_dex_chunks_partial(begin, pid, size);
 
         u32 codeitem_size = 0;
         read_method_bytecode(art_method_ptr, &codeitem_size);
         submit_method_event_with_bytecode(begin, pid, size, art_method_ptr, dex_method_index, codeitem_size);
 
-        // submit dex chunks progressively via ringbuf
-        submit_dex_chunks_partial(begin, pid, size);
+
     }
 
     return 0;
@@ -302,7 +305,6 @@ int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
     }
 
     u64 art_method_ptr = (u64)PT_REGS_PARM1(ctx);
-    bpf_printk("ArtMethod ptr: %llx", art_method_ptr);
     if (filter_art(art_method_ptr)) return 0;
 
     // 读取ArtMethod中的dex_method_index (偏移量0x08)
@@ -339,18 +341,19 @@ int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
                 dex_evt->begin = begin;
                 dex_evt->pid = pid;
                 dex_evt->size = size;
-                bpf_ringbuf_submit(dex_evt, 0);
+                bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
             }
             bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
         }
 
-        // 发送方法执行事件使用ringbuf
+        // submit dex chunks progressively via ringbuf
+        submit_dex_chunks_partial(begin, pid, size);
+
+        // read codeitem
         u32 codeitem_size = 0;
         read_method_bytecode(art_method_ptr, &codeitem_size);
         submit_method_event_with_bytecode(begin, pid, size, art_method_ptr, dex_method_index, codeitem_size);
 
-        // submit dex chunks progressively via ringbuf
-        submit_dex_chunks_partial(begin, pid, size);
     }
     return 0;
 }
@@ -398,17 +401,17 @@ int uprobe_libart_nterpOpInvoke(struct pt_regs *ctx)
                 dex_evt->begin = begin;
                 dex_evt->pid = pid;
                 dex_evt->size = size;
-                bpf_ringbuf_submit(dex_evt, 0);
+                bpf_ringbuf_submit(dex_evt, BPF_RB_FORCE_WAKEUP);
             }
             bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
         }
 
+        // submit dex chunks progressively via ringbuf
+        submit_dex_chunks_partial(begin, pid, size);
+
         u32 codeitem_size = 0;
         read_method_bytecode(art_method_ptr, &codeitem_size);
         submit_method_event_with_bytecode(begin, pid, size, art_method_ptr, dex_method_index, codeitem_size);
-
-        // submit dex chunks progressively via ringbuf
-        submit_dex_chunks_partial(begin, pid, size);
     }
     return 0;
 }
@@ -451,7 +454,7 @@ int uprobe_libart_verifyClass(struct pt_regs *ctx)
             evt_ptr->begin = begin;
             evt_ptr->pid = pid;
             evt_ptr->size = size;
-            bpf_ringbuf_submit(evt_ptr, 0);
+            bpf_ringbuf_submit(evt_ptr, BPF_RB_FORCE_WAKEUP);
         }
         bpf_map_update_elem(&dexFileCache_map, &begin, &exist, BPF_ANY);
 

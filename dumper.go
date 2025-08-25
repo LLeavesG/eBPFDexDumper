@@ -358,45 +358,49 @@ func (dd *DexDumper) handleMethodEventRingBuf(CPU int, data []byte, perfMap *man
 	}
 
 	parser := dexCache.GetParser(methodHeader.Begin)
-	if parser == nil {
-		// log.Printf("Method event: dex file not cached yet, begin=0x%x", methodHeader.Begin)
-		return
-	}
 
 	var signature string
-	dd.mu.RLock()
-	if mm, ok := dd.methodSigCache[methodHeader.Begin]; ok {
-		if sig, ok2 := mm[methodHeader.MethodIndex]; ok2 {
-			signature = sig
-		}
-	}
-	dd.mu.RUnlock()
-
 	var methodName string
-	if signature == "" {
-		methodInfo, err := parser.GetMethodInfo(methodHeader.MethodIndex)
-		if err != nil {
-			log.Printf("Failed to get method info for index %d: %v", methodHeader.MethodIndex, err)
-			return
-		}
-		signature = methodInfo.PrettyMethod()
-		methodName = signature
 
-		dd.mu.Lock()
-		if _, ok := dd.methodSigCache[methodHeader.Begin]; !ok {
-			dd.methodSigCache[methodHeader.Begin] = make(map[uint32]string)
-		}
-		dd.methodSigCache[methodHeader.Begin][methodHeader.MethodIndex] = signature
-		dd.mu.Unlock()
-
+	if parser == nil {
+		// log.Printf("Method event: dex file not cached yet, begin=0x%x", methodHeader.Begin)
+		// 当没有dex缓存时，使用方法idx作为methodName
+		methodName = fmt.Sprintf("method_idx_%d", methodHeader.MethodIndex)
 	} else {
-		methodName = signature
+		dd.mu.RLock()
+		if mm, ok := dd.methodSigCache[methodHeader.Begin]; ok {
+			if sig, ok2 := mm[methodHeader.MethodIndex]; ok2 {
+				signature = sig
+			}
+		}
+		dd.mu.RUnlock()
+
+		if signature == "" {
+			methodInfo, err := parser.GetMethodInfo(methodHeader.MethodIndex)
+			if err != nil {
+				log.Printf("Failed to get method info for index %d: %v", methodHeader.MethodIndex, err)
+				// 即使获取方法信息失败，也使用方法idx作为fallback
+				methodName = fmt.Sprintf("method_idx_%d", methodHeader.MethodIndex)
+			} else {
+				signature = methodInfo.PrettyMethod()
+				methodName = signature
+
+				dd.mu.Lock()
+				if _, ok := dd.methodSigCache[methodHeader.Begin]; !ok {
+					dd.methodSigCache[methodHeader.Begin] = make(map[uint32]string)
+				}
+				dd.methodSigCache[methodHeader.Begin][methodHeader.MethodIndex] = signature
+				dd.mu.Unlock()
+			}
+		} else {
+			methodName = signature
+		}
 	}
 
 	if methodHeader.CodeitemSize > 0 {
 		if dd.trace {
 			log.Printf("%s (pid=%d, dex=0x%x, method_idx=%d, art_method=0x%x, bytecode_size=%d)",
-				signature,
+				methodName,
 				methodHeader.Pid,
 				methodHeader.Begin,
 				methodHeader.MethodIndex,
@@ -418,7 +422,7 @@ func (dd *DexDumper) handleMethodEventRingBuf(CPU int, data []byte, perfMap *man
 	} else {
 		if dd.trace {
 			log.Printf("%s (pid=%d, dex=0x%x, method_idx=%d, art_method=0x%x)",
-				signature,
+				methodName,
 				methodHeader.Pid,
 				methodHeader.Begin,
 				methodHeader.MethodIndex,
