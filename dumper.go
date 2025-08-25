@@ -236,6 +236,14 @@ func (dd *DexDumper) setupManager() error {
 					DataHandler: dd.handleDexChunkEventRingBuf,
 				},
 			},
+			{
+				Map: manager.Map{
+					Name: "read_failures",
+				},
+				RingbufMapOptions: manager.RingbufMapOptions{
+					DataHandler: dd.handleReadFailureEventRingBuf,
+				},
+			},
 		},
 	}
 
@@ -382,8 +390,7 @@ func (dd *DexDumper) handleMethodEventRingBuf(CPU int, data []byte, perfMap *man
 		if signature == "" {
 			methodInfo, err := parser.GetMethodInfo(methodHeader.MethodIndex)
 			if err != nil {
-				log.Printf("Failed to get method info for index %d: %v", methodHeader.MethodIndex, err)
-				// 即使获取方法信息失败，也使用方法idx作为fallback
+				// log.Printf("Failed to get method info for index %d: %v", methodHeader.MethodIndex, err)
 				methodName = fmt.Sprintf("method_idx_%d", methodHeader.MethodIndex)
 			} else {
 				signature = methodInfo.PrettyMethod()
@@ -476,7 +483,6 @@ type dexRecvState struct {
 	buf   []byte
 }
 
-// 处理 eBPF 侧发来的 DEX 分片事件
 func (dd *DexDumper) handleDexChunkEventRingBuf(CPU int, data []byte, ringBuf *manager.RingbufMap, mgr *manager.Manager) {
 	if len(data) < int(unsafe.Sizeof(bpfDexChunkEventT{})) {
 		log.Printf("Dex chunk event too short: %d bytes", len(data))
@@ -543,4 +549,63 @@ func (dd *DexDumper) handleDexChunkEventRingBuf(CPU int, data []byte, ringBuf *m
 		return
 	}
 	dd.mu.Unlock()
+}
+
+func (dd *DexDumper) handleReadFailureEventRingBuf(CPU int, data []byte, ringBuf *manager.RingbufMap, mgr *manager.Manager) {
+	if len(data) < int(unsafe.Sizeof(bpfDexReadFailureT{})) {
+		log.Printf("Read failure event too short: %d bytes", len(data))
+		return
+	}
+
+	buf := bytes.NewBuffer(data)
+	failureEvt := bpfDexReadFailureT{}
+	if err := binary.Read(buf, binary.LittleEndian, &failureEvt); err != nil {
+		log.Printf("Read failure event failed: %s", err)
+		return
+	}
+
+	// log.Printf("eBPF read failed at offset %d for dex 0x%x (pid=%d), using readRemoteMem fallback",
+	// 	failureEvt.FailedOffset, failureEvt.Begin, failureEvt.Pid)
+
+	dd.readRemoteDexFallback(failureEvt.Begin, failureEvt.Pid, failureEvt.Size, failureEvt.FailedOffset)
+}
+
+func (dd *DexDumper) readRemoteDexFallback(begin uint64, pid uint32, totalSize uint32, startOffset uint32) {
+	buf := make([]byte, totalSize)
+
+	ret := C.readRemoteMem(C.pid_t(pid), unsafe.Pointer(&buf[0]), C.size_t(totalSize),
+		unsafe.Pointer(uintptr(begin)))
+
+	if ret < 0 {
+		log.Printf("readRemoteMem failed for dex 0x%x: %d", begin, ret)
+		return
+	}
+
+	readSize := uint32(ret)
+	if readSize != totalSize {
+		log.Printf("readRemoteMem partial read: expected %d, got %d", totalSize, readSize)
+		buf = buf[:readSize]
+	}
+
+	dd.mu.Lock()
+	delete(dd.pendingDex, begin)
+	dd.dexSizes[begin] = totalSize
+	dd.mu.Unlock()
+
+	if err := dexCache.AddDexFile(begin, buf); err != nil {
+		log.Printf("Failed to add dex file to cache: %v", err)
+	}
+
+	fileName := fmt.Sprintf("%s/dex_%x_%x.dex", outputPath, begin, totalSize)
+	f, err := os.Create(fileName)
+	if err != nil {
+		log.Printf("Create file failed: %v", err)
+		return
+	}
+	defer f.Close()
+	if _, err := f.Write(buf); err != nil {
+		log.Printf("Write dexData failed: %v", err)
+		return
+	}
+	log.Printf("Dex file saved to %s (fallback readRemoteMem), size %d", fileName, len(buf))
 }

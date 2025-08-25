@@ -51,6 +51,13 @@ func FixDexDirectory(outputDir string) error {
 	if len(pairs) == 0 {
 		return fmt.Errorf("no dex_*_code.json found in %s", outputDir)
 	}
+	// make fix dir in outputDir
+	fixDir := filepath.Join(outputDir, "fix")
+	if err := os.MkdirAll(fixDir, 0755); err != nil {
+		return fmt.Errorf("failed to create fix dir %s: %w", fixDir, err)
+	}
+
+	// Change to fix dir for output
 
 	for base, jsonPath := range pairs {
 		dexPath := filepath.Join(outputDir, base+".dex")
@@ -58,9 +65,9 @@ func FixDexDirectory(outputDir string) error {
 			// no matching dex, skip
 			continue
 		}
-		outPath := filepath.Join(outputDir, base+"_fix.dex")
+		// 输出到 fix 子目录
+		outPath := filepath.Join(fixDir, base+"_fix.dex")
 		if err := FixOneDex(dexPath, jsonPath, outPath); err != nil {
-			// continue processing others but report last error at end
 			fmt.Fprintf(os.Stdout, "[!] Fix failed for %s: %v\n", dexPath, err)
 		} else {
 			fmt.Fprintf(os.Stdout, "[+] Wrote %s\n", outPath)
