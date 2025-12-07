@@ -136,7 +136,7 @@ void submit_method_event_with_bytecode(u64 begin, u32 pid, u32 size, u64 art_met
 }
 
 // Max chunks per invocation to control runtime
-#define MAX_CHUNKS_PER_CALL 64
+#define MAX_CHUNKS_PER_CALL 128  // Increased for faster DEX transfer
 
 static __always_inline void submit_dex_chunks_partial(u64 begin, u32 pid, u32 size) {
     if (size == 0) return;

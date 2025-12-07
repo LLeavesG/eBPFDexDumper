@@ -7,9 +7,9 @@
 
 #define TASK_COMM_LEN 16
 #define MAX_ARGS_NUM 16
-#define MAX_PERCPU_BUFSIZE  (1 << 14)     // This value is actually set by the kernel as an upper bound
+#define MAX_PERCPU_BUFSIZE  (1 << 14)     // 16KB - kernel limit
 
-#define RINGBUF_SIZE (1 << 18)   // 256KB per chunk event
+#define RINGBUF_SIZE (1 << 17)   // 128KB per chunk
 
 struct config_t{
 	uid_t uid;
@@ -61,19 +61,19 @@ typedef struct simple_buf {
 // Events submission for dex file dumps using ringbuf
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 24);
+    __uint(max_entries, 1 << 22);  // 4MB
 } events SEC(".maps");
 
 // Events submission for method execution traces using ringbuf
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 24);
+    __uint(max_entries, 1 << 24);  // 16MB
 } method_events SEC(".maps");
 
 // Chunked dex data ring buffer
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 24);
+    __uint(max_entries, 1 << 24);  // 16MB
 } dex_chunks SEC(".maps");
 
 // Ring buffer for dex read failure notifications

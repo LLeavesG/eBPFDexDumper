@@ -12,6 +12,8 @@ Android in-memory DEX dumper powered by eBPF technology.
 - **Passive dump**: Non-intrusive memory analysis
 - **Real-time tracing**: Optional method execution monitoring
 - **Automatic fixing**: Built-in DEX file repair functionality
+- **High performance**: Lock-free caching and optimized string processing
+- **Simplified operation**: Smart defaults, dump and fix in one command
 
 **Showcase**: https://blog.lleavesg.top/article/eBPFDexDumper
 
@@ -23,7 +25,7 @@ Android in-memory DEX dumper powered by eBPF technology.
 **Note**: On other Android versions you may need minor adjustments and rebuild.
 
 ## Prerequisites
-Before dumping, it's recommended to remove the app's OAT optimization output to avoid `cdex` or empty results. You can do this manually, or let the tool remove it automatically with `--clean-oat`:
+The tool automatically removes the app's OAT optimization output to avoid `cdex` or empty results. For manual operation:
 - Find base path: `pm path <package>`
 - Remove oat folder: delete the app's `oat/` directory under `/data/app/.../<package>/`
 
@@ -47,36 +49,43 @@ Attach uprobes to libart and stream DEX/method events. You must provide either `
 - `--uid, -u <uid>` - Filter by UID (alternative to `--name`) (default: 0)
 - `--name, -n <package>` - Android package name to derive UID (alternative to `--uid`)
 - `--libart, -l <path>` - Path to libart.so (default: `/apex/com.android.art/lib64/libart.so`)
-- `--out, -o, --output <dir>` - Output directory on device (required)
+- `--out, -o, --output <dir>` - Output directory on device (default: `/data/local/tmp/dex_out`)
 - `--trace, -t` - Print executed methods in real time during dumping (default: false)
-- `--clean-oat, -c` - Remove `/data/app/.../oat` folders of target app(s) before dumping (default: false)
-- `--execute-offset <value>` - Manual offset for art::interpreter::Execute function (hex value, e.g. 0x12345)(If not specified, it will be auto-found)
-- `--nterp-offset <value>` - Manual offset for ExecuteNterpImpl function (hex value, e.g. 0x12345) (If not specified, it will be auto-found)
+- `--clean-oat, -c` - Remove `/data/app/.../oat` folders of target app(s) before dumping (default: **true**)
+- `--auto-fix, -f` - Automatically fix DEX files after dumping (default: **true**)
+- `--no-clean-oat` - Disable automatic OAT cleaning
+- `--no-auto-fix` - Disable automatic DEX fixing
+- `--execute-offset <value>` - Manual offset for art::interpreter::Execute function (hex value, e.g. 0x12345)
+- `--nterp-offset <value>` - Manual offset for ExecuteNterpImpl function (hex value, e.g. 0x12345)
 
 **Examples:**
 ```bash
-# Filter by UID
-./eBPFDexDumper dump -u 10244 -o /data/local/tmp/out
+# Simplest usage - just specify package name, auto dump+clean-oat+fix
+./eBPFDexDumper dump -n com.example.app
 
-# Filter by package name (UID auto-resolved)
-./eBPFDexDumper dump -n com.example.app -o /data/local/tmp/out
+# Filter by UID
+./eBPFDexDumper dump -u 10244
 
 # Enable realtime method trace output
-./eBPFDexDumper dump -n com.example.app -o /data/local/tmp/out -t
+./eBPFDexDumper dump -n com.example.app -t
 
-# Custom libart path
-./eBPFDexDumper dump -u 10244 -l /apex/com.android.art/lib64/libart.so -o /sdcard/dex_out
+# Custom output directory
+./eBPFDexDumper dump -n com.example.app -o /sdcard/dex_out
 
-# Auto-remove oat to improve completeness
-./eBPFDexDumper dump -n com.example.app -o /data/local/tmp/out -c
+# Disable auto-fix (dump only)
+./eBPFDexDumper dump -n com.example.app --no-auto-fix
+
+# Disable auto clean-oat
+./eBPFDexDumper dump -n com.example.app --no-clean-oat
 
 # Use manual offsets for specific ART versions
-./eBPFDexDumper dump -n com.example.app -o /data/local/tmp/out --execute-offset 0x12345 --nterp-offset 0x67890
+./eBPFDexDumper dump -n com.example.app --execute-offset 0x12345 --nterp-offset 0x67890
 ```
 
 **Output Files:**
 - **DEX files**: `dex_<begin>_<size>.dex` saved under the output directory
 - **Method bytecode JSON**: `dex_<begin>_<size>_code.json` saved on shutdown (SIGINT/SIGTERM) or normal exit
+- **Fixed DEX files**: `fix/dex_<begin>_<size>_fix.dex` saved in `fix` subdirectory after auto-fix
 
 ### `fix` Command
 Scan a directory for dumped DEX files and fix headers/structures for readability.
@@ -144,9 +153,9 @@ adb shell chmod +x /data/local/tmp/eBPFDexDumper
 ```
 
 **3. Empty or Incomplete DEX Files**
-- Use `--clean-oat` flag to remove OAT optimization
-- Ensure the target app is actively running
-- Try manual offset values for your specific Android version
+- Ensure the target app is actively running (tool has `--clean-oat` enabled by default)
+- If issue persists, try manual offset values
+- Check if you have sufficient permissions to read target process memory
 
 **4. Cannot Find libart.so**
 ```bash

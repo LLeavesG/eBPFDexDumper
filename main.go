@@ -66,9 +66,12 @@ OPTIONS:
 					&cli.Uint64Flag{Name: "uid", Aliases: []string{"u"}, Usage: "Filter by UID (alternative to --name)"},
 					&cli.StringFlag{Name: "name", Aliases: []string{"n"}, Usage: "Android package name to derive UID (alternative to --uid)"},
 					&cli.StringFlag{Name: "libart", Aliases: []string{"l"}, Usage: "Path to libart.so (target device)", Value: "/apex/com.android.art/lib64/libart.so", DefaultText: "/apex/com.android.art/lib64/libart.so"},
-					&cli.StringFlag{Name: "out", Aliases: []string{"o", "output"}, Usage: "Output directory on device", Required: true},
+					&cli.StringFlag{Name: "out", Aliases: []string{"o", "output"}, Usage: "Output directory on device", Value: "/data/local/tmp/dex_out", DefaultText: "/data/local/tmp/dex_out"},
 					&cli.BoolFlag{Name: "trace", Aliases: []string{"t"}, Usage: "Print executed methods in real time during dumping"},
-					&cli.BoolFlag{Name: "clean-oat", Aliases: []string{"c"}, Usage: "Remove /data/app/.../oat folders of target app(s) before dumping"},
+					&cli.BoolFlag{Name: "clean-oat", Aliases: []string{"c"}, Usage: "Remove /data/app/.../oat folders of target app(s) before dumping", Value: true},
+					&cli.BoolFlag{Name: "auto-fix", Aliases: []string{"f"}, Usage: "Automatically fix DEX files after dumping", Value: true},
+					&cli.BoolFlag{Name: "no-clean-oat", Usage: "Disable automatic oat cleaning"},
+					&cli.BoolFlag{Name: "no-auto-fix", Usage: "Disable automatic DEX fixing"},
 					&cli.Uint64Flag{Name: "execute-offset", Usage: "Manual offset for art::interpreter::Execute function (hex value, e.g. 0x12345)"},
 					&cli.Uint64Flag{Name: "nterp-offset", Usage: "Manual offset for ExecuteNterpImpl function (hex value, e.g. 0x12345)"},
 				},
@@ -78,7 +81,8 @@ OPTIONS:
 					libArtPath := c.String("libart")
 					outputDir := c.String("out")
 					trace := c.Bool("trace")
-					cleanOat := c.Bool("clean-oat")
+					cleanOat := c.Bool("clean-oat") && !c.Bool("no-clean-oat")
+					autoFix := c.Bool("auto-fix") && !c.Bool("no-auto-fix")
 					executeOffset := c.Uint64("execute-offset")
 					nterpOffset := c.Uint64("nterp-offset")
 
@@ -108,7 +112,7 @@ OPTIONS:
 						}
 					}
 
-					dumper := NewDexDumper(libArtPath, uid, outputDir, trace, executeOffset, nterpOffset)
+					dumper := NewDexDumper(libArtPath, uid, outputDir, trace, autoFix, executeOffset, nterpOffset)
 
 					ctx, cancel := context.WithCancel(context.Background())
 					defer cancel()

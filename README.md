@@ -12,6 +12,8 @@
 - **被动转储**: 非侵入式内存分析
 - **实时追踪**: 可选的方法执行监控
 - **自动修复**: 内置 DEX 文件修复功能
+- **高性能**: 使用无锁缓存和优化的字符串处理
+- **简化操作**: 智能默认配置，一条命令完成转储和修复
 
 **展示**: https://blog.lleavesg.top/article/eBPFDexDumper
 
@@ -23,7 +25,7 @@
 **注意**: 在其他 Android 版本上可能需要微调并重新编译。
 
 ## 先决条件
-在转储之前，建议删除应用的 OAT 优化输出以避免 `cdex` 或空结果。您可以手动执行此操作，或让工具使用 `--clean-oat` 自动删除：
+工具默认会自动删除应用的 OAT 优化输出以避免 `cdex` 或空结果。如需手动操作：
 - 查找基础路径: `pm path <package>`
 - 删除 oat 文件夹: 删除 `/data/app/.../<package>/` 下的应用 `oat/` 目录
 
@@ -47,36 +49,43 @@ eBPFDexDumper [命令] [选项]
 - `--uid, -u <uid>` - 按 UID 过滤（`--name` 的替代方案）（默认值：0）
 - `--name, -n <package>` - Android 包名以派生 UID（`--uid` 的替代方案）
 - `--libart, -l <path>` - libart.so 路径（默认值：`/apex/com.android.art/lib64/libart.so`）
-- `--out, -o, --output <dir>` - 设备上的输出目录（必需）
+- `--out, -o, --output <dir>` - 设备上的输出目录（默认值：`/data/local/tmp/dex_out`）
 - `--trace, -t` - 在转储期间实时打印执行的方法（默认值：false）
-- `--clean-oat, -c` - 在转储前删除目标应用的 `/data/app/.../oat` 文件夹（默认值：false）
-- `--execute-offset <value>` - art::interpreter::Execute 函数的手动偏移量（十六进制值，例如 0x12345）(不指定参数会自动寻找) (在IDA中通过搜索字符串Interpreting 被哪些函数索引定位，见下文 - 高版本Android中libart.so去除符号后如何寻找正确的偏移)
-- `--nterp-offset <value>` - ExecuteNterpImpl 函数的手动偏移量（十六进制值，例如 0x12345）(不指定参数会自动寻找) (默认字节码匹配，一般情况下会自动搜索到) 
+- `--clean-oat, -c` - 在转储前删除目标应用的 `/data/app/.../oat` 文件夹（默认值：**true**）
+- `--auto-fix, -f` - 转储完成后自动修复 DEX 文件（默认值：**true**）
+- `--no-clean-oat` - 禁用自动清理 OAT
+- `--no-auto-fix` - 禁用自动修复 DEX
+- `--execute-offset <value>` - art::interpreter::Execute 函数的手动偏移量（十六进制值，例如 0x12345）(不指定参数会自动寻找)
+- `--nterp-offset <value>` - ExecuteNterpImpl 函数的手动偏移量（十六进制值，例如 0x12345）(不指定参数会自动寻找)
 
 **示例:**
 ```bash
-# 按 UID 过滤
-./eBPFDexDumper dump -u 10244 -o /data/local/tmp/out
+# 最简用法 - 只需指定包名，自动完成转储+清理OAT+修复DEX
+./eBPFDexDumper dump -n com.example.app
 
-# 按包名过滤（自动解析 UID）
-./eBPFDexDumper dump -n com.example.app -o /data/local/tmp/out
+# 按 UID 过滤
+./eBPFDexDumper dump -u 10244
 
 # 启用实时方法追踪输出
-./eBPFDexDumper dump -n com.example.app -o /data/local/tmp/out -t
+./eBPFDexDumper dump -n com.example.app -t
 
-# 自定义 libart 路径
-./eBPFDexDumper dump -u 10244 -l /apex/com.android.art/lib64/libart.so -o /sdcard/dex_out
+# 自定义输出目录
+./eBPFDexDumper dump -n com.example.app -o /sdcard/dex_out
 
-# 自动删除 oat 以提高完整性
-./eBPFDexDumper dump -n com.example.app -o /data/local/tmp/out -c
+# 禁用自动修复（只转储不修复）
+./eBPFDexDumper dump -n com.example.app --no-auto-fix
+
+# 禁用自动清理 OAT
+./eBPFDexDumper dump -n com.example.app --no-clean-oat
 
 # 为特定 ART 版本使用手动偏移量
-./eBPFDexDumper dump -n com.example.app -o /data/local/tmp/out --execute-offset 0x12345 --nterp-offset 0x67890
+./eBPFDexDumper dump -n com.example.app --execute-offset 0x12345 --nterp-offset 0x67890
 ```
 
 **输出文件:**
 - **DEX 文件**: `dex_<begin>_<size>.dex` 保存在输出目录下
 - **方法字节码 JSON**: `dex_<begin>_<size>_code.json` 在关闭时保存（SIGINT/SIGTERM）或正常退出
+- **修复后的 DEX**: `fix/dex_<begin>_<size>_fix.dex` 自动修复后保存在 `fix` 子目录
 
 ![alt text](img/image-dump.png)
 ### `fix` 命令
@@ -148,9 +157,9 @@ adb shell chmod +x /data/local/tmp/eBPFDexDumper
 ```
 
 **3. 空或不完整的 DEX 文件**
-- 使用 `--clean-oat` 标志删除 OAT 优化
-- 确保目标应用正在运行
-- 为您的特定 Android 版本尝试手动偏移值
+- 确保目标应用正在运行（工具默认已开启 `--clean-oat`）
+- 如果问题持续，尝试手动偏移值
+- 检查是否有足够权限读取目标进程内存
 
 **4. 找不到 libart.so**
 ```bash

@@ -301,6 +301,210 @@ func findPatternUAddrs(path string, pattern []byte) ([]uint64, error) {
 	return addrs, nil
 }
 
+// findStringInELF finds the virtual address of a string in ELF file
+func findStringInELF(path string, target string) (uint64, error) {
+	f, err := elf.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("open elf failed: %w", err)
+	}
+	defer f.Close()
+
+	targetBytes := []byte(target)
+	for _, p := range f.Progs {
+		if p.Type != elf.PT_LOAD {
+			continue
+		}
+		rs := p.Open()
+		if rs == nil {
+			continue
+		}
+		data, err := io.ReadAll(rs)
+		if err != nil {
+			continue
+		}
+		idx := bytes.Index(data, targetBytes)
+		if idx >= 0 {
+			return p.Vaddr + uint64(idx), nil
+		}
+	}
+	return 0, fmt.Errorf("string %q not found", target)
+}
+
+// findExecuteByInterpretingString finds art::interpreter::Execute by searching for
+// "Interpreting " string reference. The Execute function has 6 parameters and
+// uses W5 register early in its body (TBNZ W5, #0, ...).
+func findExecuteByInterpretingString(path string) (uint64, error) {
+	f, err := elf.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("open elf failed: %w", err)
+	}
+	defer f.Close()
+
+	// Find "Interpreting " string address
+	strAddr, err := findStringInELF(path, "Interpreting ")
+	if err != nil {
+		return 0, fmt.Errorf("failed to find 'Interpreting ' string: %w", err)
+	}
+	log.Printf("[+] Found 'Interpreting ' string at 0x%x", strAddr)
+
+	// Read code segment
+	var codeData []byte
+	var codeVaddr uint64
+	for _, p := range f.Progs {
+		if p.Type == elf.PT_LOAD && (p.Flags&elf.PF_X) != 0 {
+			rs := p.Open()
+			if rs == nil {
+				continue
+			}
+			data, err := io.ReadAll(rs)
+			if err != nil {
+				continue
+			}
+			codeData = data
+			codeVaddr = p.Vaddr
+			break
+		}
+	}
+	if codeData == nil {
+		return 0, fmt.Errorf("code segment not found")
+	}
+
+	// Find all ADRP/ADD or ADR sequences that reference strAddr
+	var refAddrs []uint64
+	for i := 0; i < len(codeData)-8; i += 4 {
+		pc := codeVaddr + uint64(i)
+		inst := uint32(codeData[i]) | uint32(codeData[i+1])<<8 | uint32(codeData[i+2])<<16 | uint32(codeData[i+3])<<24
+
+		// Check for ADRP instruction (page-relative address)
+		if (inst & 0x9F000000) == 0x90000000 {
+			// Decode ADRP: immhi(19bit) | immlo(2bit) -> page offset
+			immlo := (inst >> 29) & 0x3
+			immhi := (inst >> 5) & 0x7FFFF
+			imm := int64((immhi<<2)|immlo) << 12
+			if (imm & (1 << 32)) != 0 {
+				imm |= ^int64(0) << 33
+			}
+			pageAddr := (pc &^ 0xFFF) + uint64(imm)
+
+			// Check next instruction for ADD
+			if i+4 < len(codeData)-4 {
+				nextInst := uint32(codeData[i+4]) | uint32(codeData[i+5])<<8 | uint32(codeData[i+6])<<16 | uint32(codeData[i+7])<<24
+				// ADD Xd, Xn, #imm12
+				if (nextInst & 0xFFC00000) == 0x91000000 {
+					imm12 := (nextInst >> 10) & 0xFFF
+					targetAddr := pageAddr + uint64(imm12)
+					if targetAddr == strAddr {
+						refAddrs = append(refAddrs, pc)
+					}
+				}
+			}
+		}
+
+		// Check for ADR instruction (PC-relative)
+		if (inst & 0x9F000000) == 0x10000000 {
+			immlo := (inst >> 29) & 0x3
+			immhi := (inst >> 5) & 0x7FFFF
+			imm := int64((immhi << 2) | immlo)
+			if (imm & (1 << 20)) != 0 {
+				imm |= ^int64(0) << 21
+			}
+			targetAddr := pc + uint64(imm)
+			if targetAddr == strAddr {
+				refAddrs = append(refAddrs, pc)
+			}
+		}
+	}
+
+	if len(refAddrs) == 0 {
+		return 0, fmt.Errorf("no code references to 'Interpreting ' string found")
+	}
+	log.Printf("[+] Found %d references to 'Interpreting ' string", len(refAddrs))
+
+	// For each reference, find function entry and check if it uses 6 parameters
+	for _, refAddr := range refAddrs {
+		funcAddr := findFunctionEntry(codeData, codeVaddr, refAddr)
+		if funcAddr == 0 {
+			continue
+		}
+
+		// Check if function uses W5 (6th parameter) with TBNZ/TBZ early
+		if has6thParam := checkFor6thParameter(codeData, codeVaddr, funcAddr); has6thParam {
+			log.Printf("[+] Execute function found at 0x%x (6 parameters, uses W5)", funcAddr)
+			return funcAddr, nil
+		}
+	}
+
+	return 0, fmt.Errorf("Execute function not found (no 6-parameter function found)")
+}
+
+// findFunctionEntry searches backward from refAddr to find function entry
+func findFunctionEntry(codeData []byte, codeVaddr, refAddr uint64) uint64 {
+	if refAddr < codeVaddr {
+		return 0
+	}
+	startOff := int(refAddr - codeVaddr)
+
+	// Search backward up to 0x2000 bytes for function prologue
+	maxSearch := 0x2000
+	if startOff < maxSearch {
+		maxSearch = startOff
+	}
+
+	for off := startOff; off >= startOff-maxSearch && off >= 0; off -= 4 {
+		inst := uint32(codeData[off]) | uint32(codeData[off+1])<<8 | uint32(codeData[off+2])<<16 | uint32(codeData[off+3])<<24
+
+		// Check for SUB SP, SP, #imm (function prologue)
+		// SUB SP, SP, #imm: 0xD1000000 | (imm12 << 10) | (SP << 5) | SP
+		// Encoding: 1101000100 | imm12(12) | Rn(5) | Rd(5), Rn=Rd=SP(31)
+		if (inst & 0xFFC003FF) == 0xD10003FF {
+			// Verify it's a reasonable stack allocation
+			imm12 := (inst >> 10) & 0xFFF
+			if imm12 >= 0x20 && imm12 <= 0x400 {
+				return codeVaddr + uint64(off)
+			}
+		}
+
+		// Check for STP X29, X30, [SP, #-imm]! (alternative prologue)
+		// STP with pre-index: 101010011 | imm7 | Rt2 | Rn | Rt
+		if (inst & 0xFFC07FFF) == 0xA9807BFD {
+			return codeVaddr + uint64(off)
+		}
+	}
+
+	return 0
+}
+
+// checkFor6thParameter checks if function uses W5/X5 (6th parameter) within first ~200 bytes
+func checkFor6thParameter(codeData []byte, codeVaddr, funcAddr uint64) bool {
+	if funcAddr < codeVaddr {
+		return false
+	}
+	startOff := int(funcAddr - codeVaddr)
+
+	// Check first 200 bytes of function for TBNZ/TBZ W5, #bit, label
+	checkLen := 200
+	if startOff+checkLen > len(codeData) {
+		checkLen = len(codeData) - startOff
+	}
+
+	for off := startOff; off < startOff+checkLen; off += 4 {
+		inst := uint32(codeData[off]) | uint32(codeData[off+1])<<8 | uint32(codeData[off+2])<<16 | uint32(codeData[off+3])<<24
+
+		// TBNZ: 0x37000000 | (b5 << 31) | (b40 << 19) | (imm14 << 5) | Rt
+		// TBZ:  0x36000000 | (b5 << 31) | (b40 << 19) | (imm14 << 5) | Rt
+		// For W5 (32-bit), b5=0, Rt=5
+		if (inst&0x7F000000) == 0x36000000 || (inst&0x7F000000) == 0x37000000 {
+			rt := inst & 0x1F
+			b5 := (inst >> 31) & 1
+			if rt == 5 && b5 == 0 { // W5 register
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 func parseLibArt(path string) map[string]uint64 {
 	f, err := elf.Open(path)
 	if err != nil {
@@ -373,6 +577,16 @@ func FindArtOffsets(libArtPath string, manualExecuteOffset, manualNterpOffset ui
 		if offsetVerifyClass == 0 && strings.Contains(name, "3art") && strings.Contains(name, "8verifier") && strings.Contains(name, "13ClassVerifier") && strings.Contains(name, "11VerifyClass") {
 			offsetVerifyClass = off
 			continue
+		}
+	}
+
+	// If Execute symbol is missing, try locating by "Interpreting " string reference
+	if offsetExecute == 0 {
+		if addr, ferr := findExecuteByInterpretingString(libArtPath); ferr == nil {
+			offsetExecute = addr
+			log.Printf("[+] Execute found by 'Interpreting ' string at 0x%x", offsetExecute)
+		} else {
+			log.Printf("[-] Execute not found by symbol or string reference: %v", ferr)
 		}
 	}
 
