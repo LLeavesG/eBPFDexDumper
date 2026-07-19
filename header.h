@@ -46,9 +46,21 @@ struct method_event_data_t {
 // Event for notifying read failures - go should use readRemoteMem
 struct dex_read_failure_t {
     u64 begin;       // failed dex begin address
-    u32 pid;         // target pid  
+    u32 pid;         // target pid
     u32 size;        // total dex size
     u32 failed_offset; // offset where read failed
+};
+
+// One event per JNI native method seen at RegisterNatives. Go maps fn_ptr back
+// to a module offset and injects `name` as a .symtab symbol via fixso, so
+// dynamically-registered JNI functions show real names in IDA.
+#define JNI_NAME_MAX 96
+#define JNI_SIG_MAX  96
+struct jni_method_event_t {
+    u32 pid;
+    u64 fn_ptr;               // runtime address of the native function
+    char name[JNI_NAME_MAX];  // Java method name
+    char sig[JNI_SIG_MAX];    // JNI type signature
 };
 
 typedef struct simple_buf {
@@ -81,6 +93,12 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 20);
 } read_failures SEC(".maps");
+
+// Ring buffer for JNI RegisterNatives captures
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20);
+} jni_events SEC(".maps");
 
 // Config map
 struct

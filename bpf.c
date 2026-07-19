@@ -8,6 +8,7 @@ const struct method_event_data_t *unused_method_event_data_t __attribute__((unus
 const buf_t *unused_buf_t __attribute__((unused));
 const struct dex_chunk_event_t *unused_dex_chunk_event_t __attribute__((unused));
 const struct dex_read_failure_t *unused_dex_read_failure_t __attribute__((unused));
+const struct jni_method_event_t *unused_jni_method_event_t __attribute__((unused));
 
 static int config_loaded = 0;
 static bool filter_enable = false;
@@ -243,6 +244,65 @@ bool trace_allowed(u32 pid, u32 uid)
 		}
 	}
     return true;
+}
+
+// JNINativeMethod is ABI-stable across Android versions:
+//   const char* name;      // +0
+//   const char* signature; // +8
+//   void*       fnPtr;     // +16
+#define JNI_NATIVE_METHOD_SIZE 24
+#define JNI_MAX_METHODS 512
+
+// uprobe on art::JNI<>::RegisterNatives(JNIEnv*, jclass, const JNINativeMethod*,
+// jint). Walks the methods array and emits {fn_ptr, name, sig} for each, so the
+// Go side can recover names for dynamically-registered JNI functions (which
+// carry no export symbol in the .so). The class pointer (PARM2) is deliberately
+// not dereferenced: resolving it needs version-specific ART mirror layout,
+// whereas the JNINativeMethod fields are plain C strings/pointers.
+SEC("uprobe/libart_registerNatives")
+int uprobe_libart_registerNatives(struct pt_regs *ctx)
+{
+    u32 pid = bpf_get_current_pid_tgid();
+    if (!trace_allowed(0, bpf_get_current_uid_gid())) {
+        return 0;
+    }
+
+    unsigned char *methods = (unsigned char *)PT_REGS_PARM3(ctx);
+    int count = (int)PT_REGS_PARM4(ctx);
+    if (methods == 0 || count <= 0) {
+        return 0;
+    }
+    if (count > JNI_MAX_METHODS) {
+        count = JNI_MAX_METHODS;
+    }
+
+    for (int i = 0; i < count && i < JNI_MAX_METHODS; i++) {
+        unsigned char *entry = methods + (long)i * JNI_NATIVE_METHOD_SIZE;
+        u64 name_ptr = 0, sig_ptr = 0, fn_ptr = 0;
+        bpf_probe_read_user(&name_ptr, sizeof(u64), entry + 0);
+        bpf_probe_read_user(&sig_ptr, sizeof(u64), entry + 8);
+        bpf_probe_read_user(&fn_ptr, sizeof(u64), entry + 16);
+        if (fn_ptr == 0) {
+            continue;
+        }
+        struct jni_method_event_t *e =
+            (struct jni_method_event_t *)bpf_ringbuf_reserve(&jni_events, sizeof(struct jni_method_event_t), 0);
+        if (!e) {
+            continue;
+        }
+        e->pid = pid;
+        e->fn_ptr = fn_ptr;
+        e->name[0] = 0;
+        e->sig[0] = 0;
+        if (name_ptr) {
+            bpf_probe_read_user_str(e->name, sizeof(e->name), (void *)name_ptr);
+        }
+        if (sig_ptr) {
+            bpf_probe_read_user_str(e->sig, sizeof(e->sig), (void *)sig_ptr);
+        }
+        bpf_ringbuf_submit(e, 0);
+    }
+    return 0;
 }
 
 SEC("uprobe/libart_execute")

@@ -268,7 +268,7 @@ OPTIONS:
 
 					if autoFix && len(dumped) > 0 {
 						log.Printf("[+] Auto-fixing dumped .so files...")
-						if err := FixSoDirectory(outputDir); err != nil {
+						if err := FixSoDirectory(outputDir, nil); err != nil {
 							log.Printf("[!] Auto-fix failed: %v", err)
 						}
 					}
@@ -295,10 +295,20 @@ OPTIONS:
    {{end}}`,
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "dir", Aliases: []string{"d"}, Usage: "Directory containing dumped .so files", Required: true},
+					&cli.StringFlag{Name: "symbols", Aliases: []string{"s"}, Usage: "File of 'offset name' lines to inject as .symtab symbols (e.g. recovered JNI functions)"},
 				},
 				Action: func(c *cli.Context) error {
 					outDir := c.String("dir")
-					if err := FixSoDirectory(outDir); err != nil {
+					var injected []InjectedSym
+					if sf := c.String("symbols"); sf != "" {
+						syms, err := parseSymbolFile(sf)
+						if err != nil {
+							return fmt.Errorf("read symbols file: %w", err)
+						}
+						injected = syms
+						log.Printf("[+] Loaded %d symbol(s) to inject from %s", len(injected), sf)
+					}
+					if err := FixSoDirectory(outDir, injected); err != nil {
 						return fmt.Errorf("fix so failed: %w", err)
 					}
 					log.Printf("Fix completed for directory: %s", outDir)

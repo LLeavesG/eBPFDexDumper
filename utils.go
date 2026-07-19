@@ -630,3 +630,39 @@ func FindArtOffsets(libArtPath string, manualExecuteOffset, manualNterpOffset ui
 	}
 	return offsetExecute, offsetExecuteNterp, offsetVerifyClass, nil
 }
+
+// FindRegisterNativesOffset locates art::JNI<>::RegisterNatives in libart by
+// symbol (the mangled name contains 3art, 3JNI and 15RegisterNatives). Returns
+// 0 if it can't be found, in which case JNI name recovery is simply skipped.
+// manualOffset (non-zero) overrides auto-detection.
+func FindRegisterNativesOffset(libArtPath string, manualOffset uint64) uint64 {
+	if manualOffset != 0 {
+		return manualOffset
+	}
+	f, err := elf.Open(libArtPath)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	scan := func(syms []elf.Symbol) uint64 {
+		for _, sym := range syms {
+			n := sym.Name
+			if strings.Contains(n, "3art") && strings.Contains(n, "3JNI") && strings.Contains(n, "15RegisterNatives") {
+				return sym.Value
+			}
+		}
+		return 0
+	}
+	if syms, err := f.Symbols(); err == nil {
+		if v := scan(syms); v != 0 {
+			return v
+		}
+	}
+	if dyn, err := f.DynamicSymbols(); err == nil {
+		if v := scan(dyn); v != 0 {
+			return v
+		}
+	}
+	return 0
+}

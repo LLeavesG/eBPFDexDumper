@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -29,7 +30,7 @@ const ptLoad = 1
 // every PT_LOAD segment's p_offset to equal p_vaddr and p_filesz up to p_memsz,
 // then zero the section header table (which was never part of the memory image)
 // so tools at least load the file via its program headers.
-func FixOneSo(soPath, outPath string) error {
+func FixOneSo(soPath, outPath string, injected []InjectedSym) error {
 	data, err := os.ReadFile(soPath)
 	if err != nil {
 		return fmt.Errorf("read so: %w", err)
@@ -43,7 +44,7 @@ func FixOneSo(soPath, outPath string) error {
 	}
 
 	// Preferred path: rebuild the section header table from the dynamic segment.
-	if rebuilt, rerr := RebuildSoSections(data); rerr == nil {
+	if rebuilt, rerr := RebuildSoSections(data, injected); rerr == nil {
 		if werr := os.WriteFile(outPath, rebuilt, 0644); werr != nil {
 			return fmt.Errorf("write out: %w", werr)
 		}
@@ -109,7 +110,7 @@ func FixOneSo(soPath, outPath string) error {
 
 // FixSoDirectory scans dir for dumped .so files and writes fixed copies to
 // a "fix" subdirectory, mirroring FixDexDirectory's layout.
-func FixSoDirectory(dir string) error {
+func FixSoDirectory(dir string, injected []InjectedSym) error {
 	fixDir := filepath.Join(dir, "fix")
 	if err := os.MkdirAll(fixDir, 0755); err != nil {
 		return fmt.Errorf("failed to create fix dir %s: %w", fixDir, err)
@@ -132,7 +133,7 @@ func FixSoDirectory(dir string) error {
 		}
 
 		outPath := filepath.Join(fixDir, strings.TrimSuffix(name, ".so")+"_fix.so")
-		if err := FixOneSo(path, outPath); err != nil {
+		if err := FixOneSo(path, outPath, injected); err != nil {
 			fmt.Fprintf(os.Stdout, "[!] Fix failed for %s: %v\n", path, err)
 			return nil
 		}
@@ -148,4 +149,32 @@ func FixSoDirectory(dir string) error {
 	}
 	log.Printf("[+] Fixed %d .so file(s)", count)
 	return nil
+}
+
+// parseSymbolFile reads an "offset name" map (one entry per line, blank lines
+// and '#' comments ignored) for fixso --symbols. The offset is a hex module
+// offset (with or without a 0x prefix); everything after it up to whitespace is
+// the symbol name. Typically produced by the JNI RegisterNatives capture.
+func parseSymbolFile(path string) ([]InjectedSym, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var syms []InjectedSym
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		off, err := strconv.ParseUint(strings.TrimPrefix(fields[0], "0x"), 16, 64)
+		if err != nil {
+			continue
+		}
+		syms = append(syms, InjectedSym{Name: fields[1], Value: off})
+	}
+	return syms, nil
 }
