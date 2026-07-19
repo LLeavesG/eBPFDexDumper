@@ -13,6 +13,10 @@ import (
 // Dex文件格式常量
 const (
 	DexFileMagic = 0x0A786564
+	// CompactDexMagic is "cdex" — ART's CompactDex. Such files use a compressed
+	// CodeItem layout and shared data, so they need a cdex->dex conversion
+	// before standard DEX tooling can read them.
+	CompactDexMagic = 0x78656463
 
 	// String类型定义（保留以备后用）
 	TypeByte   = 0x00
@@ -116,6 +120,9 @@ func NewDexParser(data []byte) (*DexParser, error) {
 
 	// 验证魔数
 	magic := binary.LittleEndian.Uint32(parser.header.Magic[:4])
+	if magic == CompactDexMagic {
+		return nil, fmt.Errorf("CompactDex (cdex) detected: this tool emits standard DEX; a cdex->dex conversion is needed first (e.g. vdexExtractor) — see README")
+	}
 	if magic != DexFileMagic {
 		return nil, fmt.Errorf("invalid dex magic: %x", magic)
 	}

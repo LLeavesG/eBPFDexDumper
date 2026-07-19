@@ -114,7 +114,7 @@ Dump native .so libraries from a target process's memory. Unlike `dump`, this do
 - `--no-anon` - Disable anonymous ELF region scanning
 - `--no-auto-fix` - Disable automatic .so fixing
 - `--include-system` - Also dump system libraries under `/system`, `/apex`, `/vendor` (skipped by default)
-- `--watch, -w` - Keep watching the process and dump modules as they appear (captures runtime-decrypted libs)
+- `--watch, -w` - Keep watching the process and dump modules as they appear, re-dumping when their contents change (e.g. in-place decryption) (captures runtime-decrypted libs)
 - `--watch-interval <sec>` - Seconds between map re-scans in `--watch` mode (default: 1)
 - `--watch-timeout <sec>` - Stop `--watch` after N seconds (0 = until interrupted, default: 60)
 
@@ -144,11 +144,35 @@ The approach is inspired by [SoFixer](https://github.com/F8LEFT/SoFixer) but rew
 
 **Options:**
 - `--dir, -d <dir>` - Directory containing dumped .so files (required)
+- `--symbols, -s <file>` - Symbol map file (`offset name` per line) to inject into a real `.symtab`; typically used to recover JNI names. When named `jni_symbols_<module>.txt`, the symbols are injected only into the matching .so, so the other dumped libraries in the directory aren't polluted
 
 **Example:**
 ```bash
 ./eBPFDexDumper fixso -d /data/local/tmp/so_out
+
+# Inject JNI symbols captured during dumping so IDA shows real function names
+./eBPFDexDumper fixso -d /data/local/tmp/so_out -s /data/local/tmp/dex_out/jni_symbols_libxxx.txt
 ```
+
+### JNI symbol recovery (dynamic registration)
+
+Many hardeners (and ordinary apps) register JNI functions **dynamically** via `RegisterNatives`; those functions carry no export symbol in the .so, so IDA only shows `sub_XXXX`. During `dump` (DEX unpacking) this tool attaches an eBPF uprobe to libart's `RegisterNatives`, captures `{fnPtr, method name, signature}`, resolves each to a module offset, and writes `jni_symbols_<module>.txt` under the output dir. Feed that to `fixso --symbols` to inject the names, and IDA shows the real JNI function names.
+
+```bash
+# 1) Unpack (also captures the JNI map into jni_symbols_*.txt)
+./eBPFDexDumper dump -n com.example.app
+# 2) Dump native .so
+./eBPFDexDumper dumpso -n com.example.app -o /data/local/tmp/so_out
+# 3) Fix and inject JNI symbols
+./eBPFDexDumper fixso -d /data/local/tmp/so_out -s /data/local/tmp/dex_out/jni_symbols_libnative.txt
+```
+
+> Note: the eBPF capture side needs an ARM64 device to run (verify on-device); the `.symtab` injection itself is architecture-independent and accepts an `offset name` map from any source (eBPF/Frida/manual).
+
+### Limitations & future work
+
+- **CompactDex (cdex)**: newer ART's compressed DEX format. This tool **detects and warns** about it but does not yet do a full `cdex→dex` conversion (CodeItems need decompression/relayout); convert with a tool like [vdexExtractor](https://github.com/anestisb/vdexExtractor) first.
+- **Active triggering for extraction-based packers**: eBPF is a **read-only** observation model — it cannot call into the target to force-decrypt methods that never execute. That kind of active unpacking needs code injection (Frida/ptrace), which is outside this tool's eBPF model. Today `dump` captures only methods that actually run.
 
 ## Installation & Build
 

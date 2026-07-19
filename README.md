@@ -116,7 +116,7 @@ eBPFDexDumper [命令] [选项]
 - `--no-anon` - 禁用匿名 ELF 区域扫描
 - `--no-auto-fix` - 禁用自动修复
 - `--include-system` - 同时转储 `/system`、`/apex`、`/vendor` 下的系统库(默认跳过)
-- `--watch, -w` - 持续监控进程,模块一出现就转储(捕获运行时解密的库)
+- `--watch, -w` - 持续监控进程,模块一出现就转储,内容变化(如原地解密)时再次转储(捕获运行时解密的库)
 - `--watch-interval <秒>` - `--watch` 模式下重新扫描 maps 的间隔(默认值:1)
 - `--watch-timeout <秒>` - `--watch` 运行多少秒后停止(0 = 直到中断,默认值:60)
 
@@ -146,11 +146,35 @@ eBPFDexDumper [命令] [选项]
 
 **选项:**
 - `--dir, -d <dir>` - 包含转储 .so 文件的目录(必需)
+- `--symbols, -s <file>` - 注入符号映射文件(每行 `偏移 名字`),写入真实 `.symtab`,常用于恢复 JNI 函数名。文件名形如 `jni_symbols_<模块>.txt` 时,符号只注入到名字匹配的那个 .so,不会污染同目录里的其它库
 
 **示例:**
 ```bash
 ./eBPFDexDumper fixso -d /data/local/tmp/so_out
+
+# 注入 dump 阶段抓到的 JNI 符号,让 IDA 显示真实函数名
+./eBPFDexDumper fixso -d /data/local/tmp/so_out -s /data/local/tmp/dex_out/jni_symbols_libxxx.txt
 ```
+
+### JNI 符号恢复(动态注册)
+
+大量加固/正常 app 通过 `RegisterNatives` **动态注册** JNI 函数,这些函数在 .so 里没有导出符号,IDA 只显示 `sub_XXXX`。本工具在 `dump`(DEX 脱壳)运行时用 eBPF uprobe 挂 libart 的 `RegisterNatives`,抓取 `{函数指针, 方法名, 签名}`,按模块解析成 `偏移 名字` 写到输出目录的 `jni_symbols_<模块>.txt`;再用 `fixso --symbols` 注入到对应 dump 的 so,IDA 便能显示真实的 JNI 函数名。
+
+```bash
+# 1) 脱壳(同时抓 JNI 映射,生成 jni_symbols_*.txt)
+./eBPFDexDumper dump -n com.example.app
+# 2) 转储 native so
+./eBPFDexDumper dumpso -n com.example.app -o /data/local/tmp/so_out
+# 3) 修复并注入 JNI 符号
+./eBPFDexDumper fixso -d /data/local/tmp/so_out -s /data/local/tmp/dex_out/jni_symbols_libnative.txt
+```
+
+> 注:eBPF 抓取依赖 ARM64 真机(需设备实测);`.symtab` 注入本身与架构无关,可注入任意来源(eBPF/Frida/手工)的 `偏移 名字` 映射。
+
+### 限制与后续
+
+- **CompactDex(cdex)**:高版本 ART 的压缩 DEX 格式。本工具会**检测并给出提示**,但暂不做 `cdex→dex` 完整转换(CodeItem 需解压重组);遇到时请先用 [vdexExtractor](https://github.com/anestisb/vdexExtractor) 等工具转换。
+- **抽取型加固的主动触发**:eBPF 是**只读观测**模型,无法主动调用目标进程的方法去强制解密未执行的方法体;这类"主动脱壳"需要代码注入(如 Frida/ptrace),不在本工具的 eBPF 模型内。当前 `dump` 只捕获**运行时被执行到**的方法。
 
 ## 安装与构建
 

@@ -44,6 +44,14 @@ type bpfDexReadFailureT struct {
 	_            [4]byte
 }
 
+type bpfJniMethodEventT struct {
+	Pid   uint32
+	_     [4]byte
+	FnPtr uint64
+	Name  [96]int8
+	Sig   [96]int8
+}
+
 type bpfMethodEventDataT struct {
 	Begin        uint64
 	Pid          uint32
@@ -98,6 +106,7 @@ type bpfProgramSpecs struct {
 	UprobeLibartExecute          *ebpf.ProgramSpec `ebpf:"uprobe_libart_execute"`
 	UprobeLibartExecuteNterpImpl *ebpf.ProgramSpec `ebpf:"uprobe_libart_executeNterpImpl"`
 	UprobeLibartNterpOpInvoke    *ebpf.ProgramSpec `ebpf:"uprobe_libart_nterpOpInvoke"`
+	UprobeLibartRegisterNatives  *ebpf.ProgramSpec `ebpf:"uprobe_libart_registerNatives"`
 	UprobeLibartVerifyClass      *ebpf.ProgramSpec `ebpf:"uprobe_libart_verifyClass"`
 }
 
@@ -111,6 +120,7 @@ type bpfMapSpecs struct {
 	DexProgressMap     *ebpf.MapSpec `ebpf:"dexProgress_map"`
 	DexChunks          *ebpf.MapSpec `ebpf:"dex_chunks"`
 	Events             *ebpf.MapSpec `ebpf:"events"`
+	JniEvents          *ebpf.MapSpec `ebpf:"jni_events"`
 	MethodCodeCacheMap *ebpf.MapSpec `ebpf:"methodCodeCache_map"`
 	MethodEvents       *ebpf.MapSpec `ebpf:"method_events"`
 	ReadFailures       *ebpf.MapSpec `ebpf:"read_failures"`
@@ -141,6 +151,7 @@ type bpfMaps struct {
 	DexProgressMap     *ebpf.Map `ebpf:"dexProgress_map"`
 	DexChunks          *ebpf.Map `ebpf:"dex_chunks"`
 	Events             *ebpf.Map `ebpf:"events"`
+	JniEvents          *ebpf.Map `ebpf:"jni_events"`
 	MethodCodeCacheMap *ebpf.Map `ebpf:"methodCodeCache_map"`
 	MethodEvents       *ebpf.Map `ebpf:"method_events"`
 	ReadFailures       *ebpf.Map `ebpf:"read_failures"`
@@ -154,6 +165,7 @@ func (m *bpfMaps) Close() error {
 		m.DexProgressMap,
 		m.DexChunks,
 		m.Events,
+		m.JniEvents,
 		m.MethodCodeCacheMap,
 		m.MethodEvents,
 		m.ReadFailures,
@@ -167,6 +179,7 @@ type bpfPrograms struct {
 	UprobeLibartExecute          *ebpf.Program `ebpf:"uprobe_libart_execute"`
 	UprobeLibartExecuteNterpImpl *ebpf.Program `ebpf:"uprobe_libart_executeNterpImpl"`
 	UprobeLibartNterpOpInvoke    *ebpf.Program `ebpf:"uprobe_libart_nterpOpInvoke"`
+	UprobeLibartRegisterNatives  *ebpf.Program `ebpf:"uprobe_libart_registerNatives"`
 	UprobeLibartVerifyClass      *ebpf.Program `ebpf:"uprobe_libart_verifyClass"`
 }
 
@@ -175,6 +188,7 @@ func (p *bpfPrograms) Close() error {
 		p.UprobeLibartExecute,
 		p.UprobeLibartExecuteNterpImpl,
 		p.UprobeLibartNterpOpInvoke,
+		p.UprobeLibartRegisterNatives,
 		p.UprobeLibartVerifyClass,
 	)
 }
