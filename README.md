@@ -12,7 +12,7 @@
 - **被动转储**: 非侵入式内存分析
 - **实时追踪**: 可选的方法执行监控
 - **自动修复**: 内置 DEX 文件修复功能
-- **Native 层转储**: 支持从进程内存中转储 .so 动态库(含自映射的匿名 ELF 镜像),并自动修复段头以便静态分析
+- **Native 层转储**: 支持从进程内存中转储 .so 动态库(含自映射的匿名 ELF 镜像),并自动从 `.dynamic` 段重建完整的 section header 表,让 IDA/Ghidra 直接识别符号、导入导出与重定位
 - **高性能**: 使用无锁缓存和优化的字符串处理
 - **简化操作**: 智能默认配置，一条命令完成转储和修复
 
@@ -130,10 +130,12 @@ eBPFDexDumper [命令] [选项]
 
 **输出文件:**
 - **原始 .so**: `so_<pid>_<base>_<size>_<name>.so` 保存在输出目录下
-- **修复后的 .so**: `fix/so_<pid>_<base>_<size>_<name>_fix.so`,重写了 `PT_LOAD` 段的 `p_offset`/`p_filesz` 并清空过期的节头信息,便于 IDA/Ghidra 等工具直接加载分析
+- **修复后的 .so**: `fix/so_<pid>_<base>_<size>_<name>_fix.so`,已重建完整的 section header 表,可直接丢进 IDA/Ghidra 分析
 
 ### `fixso` 命令
-扫描目录中转储的 .so 文件并修复段头。
+扫描目录中转储的 .so 文件并修复,使其可被 IDA 正确识别。
+
+修复思路参考了 [SoFixer](https://github.com/F8LEFT/SoFixer) 但针对 ARM64/ELF64 重写:内存 dump 出来的 so 丢失了 section header 表(加载器不映射它),IDA 只能靠 program header 勉强加载,符号/PLT/GOT 识别不全。本工具会先把 `PT_LOAD` 段的 `p_offset` 归一化到 `p_vaddr`,再**解析 `PT_DYNAMIC` 段**,从 `DT_SYMTAB/STRTAB/GNU_HASH/RELA/RELR/JMPREL/PLTGOT/VERSYM/VERDEF/VERNEED/INIT_ARRAY/FINI_ARRAY` 等 tag 反推出 `.dynsym`/`.dynstr`/`.rela.dyn`/`.rela.plt`/`.relr.dyn`/`.dynamic` 等 section 的地址与大小,按地址排序后补全各 section 尺寸,并把符号表里指向原始布局的 `st_shndx` 重映射到重建后的 section,最终追加一张完整的 section header 表。这样 IDA 就能像加载正常 so 一样识别符号、导入导出与重定位。若目标缺少 `PT_DYNAMIC` 无法重建,则自动回退到仅归一化 `p_offset` + 清空 section header 的兜底方案。
 
 **选项:**
 - `--dir, -d <dir>` - 包含转储 .so 文件的目录(必需)

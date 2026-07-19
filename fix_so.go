@@ -23,15 +23,15 @@ const (
 // tools (IDA/Ghidra/objdump) can load it. A dump built from /proc/<pid>/maps
 // places each segment's bytes at (vaddr - moduleBase) in the output buffer,
 // which does not match the on-disk file layout the original ELF header
-// describes, so two things are patched for every PT_LOAD segment:
-//   - p_offset is rewritten to equal p_vaddr, matching how the dump was laid out
-//   - p_filesz is raised to p_memsz, since the memory image already contains
-//     the segment's full size (e.g. the zero-filled .bss tail)
+// describes.
 //
-// The section header table is never patched in place: it lives outside every
-// PT_LOAD segment (the loader has no reason to map it), so it was never part
-// of the memory dump. e_shoff/e_shnum/e_shstrndx are zeroed instead of left
-// pointing at stale offsets copied from the live header.
+// The preferred fix reconstructs a full section header table from the dynamic
+// segment (see RebuildSoSections), which restores .dynsym/.dynstr, relocation,
+// hash and version sections so IDA recognizes symbols, imports and relocations.
+// If that can't run (e.g. no PT_DYNAMIC), it falls back to a minimal fix: patch
+// every PT_LOAD segment's p_offset to equal p_vaddr and p_filesz up to p_memsz,
+// then zero the section header table (which was never part of the memory image)
+// so tools at least load the file via its program headers.
 func FixOneSo(soPath, outPath string) error {
 	data, err := os.ReadFile(soPath)
 	if err != nil {
@@ -45,6 +45,17 @@ func FixOneSo(soPath, outPath string) error {
 		return fmt.Errorf("only ELF64 is supported (EI_CLASS=%d)", data[4])
 	}
 
+	// Preferred path: rebuild the section header table from the dynamic segment.
+	if rebuilt, rerr := RebuildSoSections(data); rerr == nil {
+		if werr := os.WriteFile(outPath, rebuilt, 0644); werr != nil {
+			return fmt.Errorf("write out: %w", werr)
+		}
+		return nil
+	} else {
+		log.Printf("[fixso] section rebuild unavailable for %s (%v); falling back to header-only fix", filepath.Base(soPath), rerr)
+	}
+
+	// Fallback: normalize p_offset and zero out the section header table.
 	phoff := binary.LittleEndian.Uint64(data[32:40])
 	phentsize := binary.LittleEndian.Uint16(data[54:56])
 	phnum := binary.LittleEndian.Uint16(data[56:58])

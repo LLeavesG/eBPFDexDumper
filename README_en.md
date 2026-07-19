@@ -12,7 +12,7 @@ Android in-memory DEX dumper powered by eBPF technology.
 - **Passive dump**: Non-intrusive memory analysis
 - **Real-time tracing**: Optional method execution monitoring
 - **Automatic fixing**: Built-in DEX file repair functionality
-- **Native-layer dumping**: Dump .so libraries straight out of process memory (including self-mapped anonymous ELF images), with automatic segment-header fixing for static analysis
+- **Native-layer dumping**: Dump .so libraries straight out of process memory (including self-mapped anonymous ELF images), automatically rebuilding a full section header table from the `.dynamic` segment so IDA/Ghidra recognize symbols, imports/exports and relocations
 - **High performance**: Lock-free caching and optimized string processing
 - **Simplified operation**: Smart defaults, dump and fix in one command
 
@@ -128,10 +128,12 @@ Dump native .so libraries from a target process's memory. Unlike `dump`, this do
 
 **Output Files:**
 - **Raw .so**: `so_<pid>_<base>_<size>_<name>.so` saved under the output directory
-- **Fixed .so**: `fix/so_<pid>_<base>_<size>_<name>_fix.so`, with each `PT_LOAD` segment's `p_offset`/`p_filesz` rewritten and stale section-header fields cleared so IDA/Ghidra and similar tools can load it directly
+- **Fixed .so**: `fix/so_<pid>_<base>_<size>_<name>_fix.so`, with a full section header table rebuilt so it drops straight into IDA/Ghidra
 
 ### `fixso` Command
-Scan a directory for dumped .so files and fix their segment headers.
+Scan a directory for dumped .so files and repair them so IDA recognizes them.
+
+The approach is inspired by [SoFixer](https://github.com/F8LEFT/SoFixer) but rewritten for ARM64/ELF64: a memory-dumped .so has lost its section header table (the loader never maps it), so IDA can only load it via program headers and misses many symbols/PLT/GOT entries. This tool first normalizes each `PT_LOAD` segment's `p_offset` to `p_vaddr`, then **parses the `PT_DYNAMIC` segment** and reconstructs the addresses and sizes of `.dynsym`/`.dynstr`/`.rela.dyn`/`.rela.plt`/`.relr.dyn`/`.dynamic` and friends from the `DT_SYMTAB/STRTAB/GNU_HASH/RELA/RELR/JMPREL/PLTGOT/VERSYM/VERDEF/VERNEED/INIT_ARRAY/FINI_ARRAY` tags. Sections are sorted by address to fill in unknown sizes, each symbol's `st_shndx` (which pointed at the original layout) is remapped to the rebuilt section that contains it, and a complete section header table is appended. IDA then recognizes symbols, imports/exports and relocations just like a normal .so. If the target has no `PT_DYNAMIC` and can't be rebuilt, it falls back to only normalizing `p_offset` and zeroing the section headers.
 
 **Options:**
 - `--dir, -d <dir>` - Directory containing dumped .so files (required)
