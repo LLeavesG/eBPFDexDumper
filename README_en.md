@@ -12,6 +12,7 @@ Android in-memory DEX dumper powered by eBPF technology.
 - **Passive dump**: Non-intrusive memory analysis
 - **Real-time tracing**: Optional method execution monitoring
 - **Automatic fixing**: Built-in DEX file repair functionality
+- **Native-layer dumping**: Dump .so libraries straight out of process memory (including self-mapped anonymous ELF images), with automatic segment-header fixing for static analysis
 - **High performance**: Lock-free caching and optimized string processing
 - **Simplified operation**: Smart defaults, dump and fix in one command
 
@@ -41,6 +42,8 @@ eBPFDexDumper [command] [options]
 **Available Commands:**
 - `dump` - Start eBPF-based DEX dumper
 - `fix` - Fix dumped DEX files in a directory
+- `dumpso` - Dump native .so libraries from a running process's memory
+- `fixso` - Fix dumped .so files in a directory
 
 ### `dump` Command
 Attach uprobes to libart and stream DEX/method events. You must provide either `--uid` or `--name` to filter the target app.
@@ -96,6 +99,46 @@ Scan a directory for dumped DEX files and fix headers/structures for readability
 **Example:**
 ```bash
 ./eBPFDexDumper fix -d /data/local/tmp/out
+```
+
+### `dumpso` Command
+Dump native .so libraries from a target process's memory. Unlike `dump`, this does not rely on eBPF/uprobes: it parses the target process's `/proc/<pid>/maps` directly, merges a library's separately-mapped segments (r--/r-x/rw-) back into one contiguous image, and reads it out via `process_vm_readv`. By default it also scans path-less (anonymous) memory regions and treats any whose first page starts with the ELF magic (`\x7fELF`) as a self-mapped/self-decrypted library to dump as well - useful against apps whose native-layer hardening/VMP doesn't load libraries through the normal dynamic linker path. You must provide either `--uid` or `--name` to select the target process(es).
+
+**Options:**
+- `--uid, -u <uid>` - Filter by UID (alternative to `--name`)
+- `--name, -n <package>` - Android package name to derive UID (alternative to `--uid`)
+- `--lib, -l <substr>` - Only dump libraries whose path contains this substring (default: all app-mapped .so files)
+- `--out, -o, --output <dir>` - Output directory on device (default: `/data/local/tmp/so_out`)
+- `--anon, -a` - Also scan anonymous memory regions for self-mapped ELF images (default: **true**)
+- `--auto-fix, -f` - Automatically fix dumped .so files after dumping (default: **true**)
+- `--no-anon` - Disable anonymous ELF region scanning
+- `--no-auto-fix` - Disable automatic .so fixing
+
+**Examples:**
+```bash
+# Simplest usage - dump every .so mapped by the app's process(es), auto-fix
+./eBPFDexDumper dumpso -n com.example.app
+
+# Dump one specific library
+./eBPFDexDumper dumpso -n com.example.app -l libnative-lib.so
+
+# Skip anonymous ELF scanning, only handle normally-linked libraries
+./eBPFDexDumper dumpso -n com.example.app --no-anon
+```
+
+**Output Files:**
+- **Raw .so**: `so_<pid>_<base>_<size>_<name>.so` saved under the output directory
+- **Fixed .so**: `fix/so_<pid>_<base>_<size>_<name>_fix.so`, with each `PT_LOAD` segment's `p_offset`/`p_filesz` rewritten and stale section-header fields cleared so IDA/Ghidra and similar tools can load it directly
+
+### `fixso` Command
+Scan a directory for dumped .so files and fix their segment headers.
+
+**Options:**
+- `--dir, -d <dir>` - Directory containing dumped .so files (required)
+
+**Example:**
+```bash
+./eBPFDexDumper fixso -d /data/local/tmp/so_out
 ```
 
 ## Installation & Build

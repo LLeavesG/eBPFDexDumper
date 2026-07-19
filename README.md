@@ -12,6 +12,7 @@
 - **被动转储**: 非侵入式内存分析
 - **实时追踪**: 可选的方法执行监控
 - **自动修复**: 内置 DEX 文件修复功能
+- **Native 层转储**: 支持从进程内存中转储 .so 动态库(含自映射的匿名 ELF 镜像),并自动修复段头以便静态分析
 - **高性能**: 使用无锁缓存和优化的字符串处理
 - **简化操作**: 智能默认配置，一条命令完成转储和修复
 
@@ -41,6 +42,8 @@ eBPFDexDumper [命令] [选项]
 **可用命令:**
 - `dump` - 启动基于 eBPF 的 DEX 转储器
 - `fix` - 修复目录中的转储 DEX 文件
+- `dumpso` - 从运行中进程的内存转储 native .so 动态库
+- `fixso` - 修复目录中转储的 .so 文件
 
 ### `dump` 命令
 将探针附加到 libart 并流式传输 DEX/方法事件。您必须提供 `--uid` 或 `--name` 之一来过滤目标应用。
@@ -99,6 +102,46 @@ eBPFDexDumper [命令] [选项]
 ./eBPFDexDumper fix -d /data/local/tmp/out
 ```
 ![alt text](img/image-fix.png)
+
+### `dumpso` 命令
+从目标进程内存中转储 native .so 动态库。与 `dump` 不同,这个功能不依赖 eBPF/uprobe,而是直接解析目标进程的 `/proc/<pid>/maps`,把同一个库分散映射的多个内存段(r--/r-x/rw-)合并还原成完整镜像,再通过 `process_vm_readv` 读出。默认还会扫描没有文件路径的匿名内存区域,只要其起始页是 ELF 魔数(`\x7fELF`),就当作自映射/自解密的库一并转储——这类不走标准动态链接器加载路径的场景,常见于对 native 层做了加固/VMP 的应用。您必须提供 `--uid` 或 `--name` 之一来选择目标进程。
+
+**选项:**
+- `--uid, -u <uid>` - 按 UID 过滤(`--name` 的替代方案)
+- `--name, -n <package>` - Android 包名以派生 UID(`--uid` 的替代方案)
+- `--lib, -l <substr>` - 只转储路径包含此子串的库(默认转储所有应用相关的 .so)
+- `--out, -o, --output <dir>` - 设备上的输出目录(默认值:`/data/local/tmp/so_out`)
+- `--anon, -a` - 同时扫描自映射的匿名 ELF 镜像(默认值:**true**)
+- `--auto-fix, -f` - 转储完成后自动修复 .so 文件(默认值:**true**)
+- `--no-anon` - 禁用匿名 ELF 区域扫描
+- `--no-auto-fix` - 禁用自动修复
+
+**示例:**
+```bash
+# 最简用法 - 按包名转储该应用所有进程映射的 .so,自动修复
+./eBPFDexDumper dumpso -n com.example.app
+
+# 只转储某个特定库
+./eBPFDexDumper dumpso -n com.example.app -l libnative-lib.so
+
+# 关闭匿名 ELF 扫描，只处理正常动态链接的库
+./eBPFDexDumper dumpso -n com.example.app --no-anon
+```
+
+**输出文件:**
+- **原始 .so**: `so_<pid>_<base>_<size>_<name>.so` 保存在输出目录下
+- **修复后的 .so**: `fix/so_<pid>_<base>_<size>_<name>_fix.so`,重写了 `PT_LOAD` 段的 `p_offset`/`p_filesz` 并清空过期的节头信息,便于 IDA/Ghidra 等工具直接加载分析
+
+### `fixso` 命令
+扫描目录中转储的 .so 文件并修复段头。
+
+**选项:**
+- `--dir, -d <dir>` - 包含转储 .so 文件的目录(必需)
+
+**示例:**
+```bash
+./eBPFDexDumper fixso -d /data/local/tmp/so_out
+```
 
 ## 安装与构建
 
