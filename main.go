@@ -22,7 +22,7 @@ func main() {
 
 	app := &cli.App{
 		Name:  "eBPFDexDumper",
-		Usage: "Dump in-memory DEX and method bytecode or fix dumped DEX files",
+		Usage: "Dump in-memory DEX/method bytecode or native .so libraries, and fix the dumped files",
 		// Custom help template shows concise top-level info and compact subcommand details
 		CustomAppHelpTemplate: `NAME:
    {{.Name}} - {{.Usage}}
@@ -167,6 +167,112 @@ OPTIONS:
 					outDir := c.String("dir")
 					if err := FixDexDirectory(outDir); err != nil {
 						return fmt.Errorf("fix dex failed: %w", err)
+					}
+					log.Printf("Fix completed for directory: %s", outDir)
+					return nil
+				},
+			},
+			{
+				Name:        "dumpso",
+				Usage:       "Dump native .so libraries from a running process's memory",
+				Description: "Scan /proc/<pid>/maps for loaded shared libraries (plus optionally self-mapped anonymous ELF images), read their full mapped span from process memory, and write raw dumps; provide either --uid or --name to select the target process(es).",
+				CustomHelpTemplate: `NAME:
+   {{.HelpName}} - {{.Usage}}
+
+USAGE:
+   {{.HelpName}} [command options]
+
+DESCRIPTION:
+   {{.Description}}
+
+OPTIONS:
+   {{range .VisibleFlags}}{{.}}
+   {{end}}`,
+				Flags: []cli.Flag{
+					&cli.Uint64Flag{Name: "uid", Aliases: []string{"u"}, Usage: "Filter by UID (alternative to --name)"},
+					&cli.StringFlag{Name: "name", Aliases: []string{"n"}, Usage: "Android package name to derive UID (alternative to --uid)"},
+					&cli.StringFlag{Name: "lib", Aliases: []string{"l"}, Usage: "Only dump libraries whose path contains this substring (default: all app-mapped .so files)"},
+					&cli.StringFlag{Name: "out", Aliases: []string{"o", "output"}, Usage: "Output directory on device", Value: "/data/local/tmp/so_out", DefaultText: "/data/local/tmp/so_out"},
+					&cli.BoolFlag{Name: "anon", Aliases: []string{"a"}, Usage: "Also scan anonymous memory regions for self-mapped ELF images", Value: true},
+					&cli.BoolFlag{Name: "auto-fix", Aliases: []string{"f"}, Usage: "Automatically fix dumped .so files after dumping", Value: true},
+					&cli.BoolFlag{Name: "no-anon", Usage: "Disable anonymous ELF region scanning"},
+					&cli.BoolFlag{Name: "no-auto-fix", Usage: "Disable automatic .so fixing"},
+				},
+				Action: func(c *cli.Context) error {
+					uid := uint32(c.Uint64("uid"))
+					pkgName := c.String("name")
+					libFilter := c.String("lib")
+					outputDir := c.String("out")
+					includeAnon := c.Bool("anon") && !c.Bool("no-anon")
+					autoFix := c.Bool("auto-fix") && !c.Bool("no-auto-fix")
+
+					if err := os.MkdirAll(outputDir, 0755); err != nil {
+						return fmt.Errorf("failed to create output directory %s: %w", outputDir, err)
+					}
+
+					if uid == 0 && pkgName == "" {
+						return fmt.Errorf("either --uid or --name must be provided")
+					}
+					if uid == 0 && pkgName != "" {
+						resolved, err := LookupUIDByPackageName(pkgName)
+						if err != nil {
+							return err
+						}
+						uid = resolved
+						log.Printf("[+] Resolved UID %d from package %q", uid, pkgName)
+					}
+
+					pids, err := FindPidsForUID(uid)
+					if err != nil {
+						return err
+					}
+					log.Printf("[+] Found %d process(es) for uid %d: %v", len(pids), uid, pids)
+
+					var dumped []string
+					for _, pid := range pids {
+						mods, err := ScanSoModules(pid, libFilter, includeAnon)
+						if err != nil {
+							log.Printf("[!] scan failed for pid %d: %v", pid, err)
+							continue
+						}
+						log.Printf("[+] pid %d: found %d candidate module(s)", pid, len(mods))
+						dumped = append(dumped, DumpSoModules(pid, mods, outputDir)...)
+					}
+
+					if autoFix && len(dumped) > 0 {
+						log.Printf("[+] Auto-fixing dumped .so files...")
+						if err := FixSoDirectory(outputDir); err != nil {
+							log.Printf("[!] Auto-fix failed: %v", err)
+						}
+					}
+
+					log.Printf("[+] Done. Dumped %d .so file(s) to %s", len(dumped), outputDir)
+					return nil
+				},
+			},
+			{
+				Name:        "fixso",
+				Usage:       "Fix dumped .so files in a directory",
+				Description: "Scan a directory for dumped .so files and rewrite segment headers for static analysis tools.",
+				CustomHelpTemplate: `NAME:
+   {{.HelpName}} - {{.Usage}}
+
+USAGE:
+   {{.HelpName}} [command options]
+
+DESCRIPTION:
+   {{.Description}}
+
+OPTIONS:
+   {{range .VisibleFlags}}{{.}}
+   {{end}}`,
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "dir", Aliases: []string{"d"}, Usage: "Directory containing dumped .so files", Required: true},
+				},
+				Action: func(c *cli.Context) error {
+					outDir := c.String("dir")
+					if err := FixSoDirectory(outDir); err != nil {
+						return fmt.Errorf("fix so failed: %w", err)
 					}
 					log.Printf("Fix completed for directory: %s", outDir)
 					return nil
