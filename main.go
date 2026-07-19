@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"time"
 
 	cli "github.com/urfave/cli/v2"
 	"golang.org/x/sys/unix"
@@ -197,6 +198,10 @@ OPTIONS:
 					&cli.BoolFlag{Name: "auto-fix", Aliases: []string{"f"}, Usage: "Automatically fix dumped .so files after dumping", Value: true},
 					&cli.BoolFlag{Name: "no-anon", Usage: "Disable anonymous ELF region scanning"},
 					&cli.BoolFlag{Name: "no-auto-fix", Usage: "Disable automatic .so fixing"},
+					&cli.BoolFlag{Name: "include-system", Usage: "Also dump system libraries under /system, /apex, /vendor (default: skip them)"},
+					&cli.BoolFlag{Name: "watch", Aliases: []string{"w"}, Usage: "Keep watching the process and dump modules as they appear (captures runtime-decrypted libs)"},
+					&cli.Uint64Flag{Name: "watch-interval", Usage: "Seconds between map re-scans in --watch mode", Value: 1},
+					&cli.Uint64Flag{Name: "watch-timeout", Usage: "Stop --watch after N seconds (0 = until interrupted)", Value: 60},
 				},
 				Action: func(c *cli.Context) error {
 					uid := uint32(c.Uint64("uid"))
@@ -205,6 +210,10 @@ OPTIONS:
 					outputDir := c.String("out")
 					includeAnon := c.Bool("anon") && !c.Bool("no-anon")
 					autoFix := c.Bool("auto-fix") && !c.Bool("no-auto-fix")
+					includeSystem := c.Bool("include-system")
+					watch := c.Bool("watch")
+					watchInterval := c.Uint64("watch-interval")
+					watchTimeout := c.Uint64("watch-timeout")
 
 					if err := os.MkdirAll(outputDir, 0755); err != nil {
 						return fmt.Errorf("failed to create output directory %s: %w", outputDir, err)
@@ -222,21 +231,39 @@ OPTIONS:
 						log.Printf("[+] Resolved UID %d from package %q", uid, pkgName)
 					}
 
-					pids, err := FindPidsForUID(uid)
-					if err != nil {
-						return err
-					}
-					log.Printf("[+] Found %d process(es) for uid %d: %v", len(pids), uid, pids)
-
 					var dumped []string
-					for _, pid := range pids {
-						mods, err := ScanSoModules(pid, libFilter, includeAnon)
-						if err != nil {
-							log.Printf("[!] scan failed for pid %d: %v", pid, err)
-							continue
+					if watch {
+						ctx, cancel := context.WithCancel(context.Background())
+						if watchTimeout > 0 {
+							ctx, cancel = context.WithTimeout(context.Background(), time.Duration(watchTimeout)*time.Second)
 						}
-						log.Printf("[+] pid %d: found %d candidate module(s)", pid, len(mods))
-						dumped = append(dumped, DumpSoModules(pid, mods, outputDir)...)
+						defer cancel()
+
+						sigChan := make(chan os.Signal, 1)
+						signal.Notify(sigChan, os.Interrupt, unix.SIGTERM)
+						go func() {
+							<-sigChan
+							cancel()
+						}()
+
+						log.Printf("[+] Watching uid %d every %ds (timeout %ds; Ctrl-C to stop)...", uid, watchInterval, watchTimeout)
+						dumped = WatchAndDump(ctx, uid, libFilter, includeAnon, includeSystem, outputDir, time.Duration(watchInterval)*time.Second)
+					} else {
+						pids, err := FindPidsForUID(uid)
+						if err != nil {
+							return err
+						}
+						log.Printf("[+] Found %d process(es) for uid %d: %v", len(pids), uid, pids)
+
+						for _, pid := range pids {
+							mods, err := ScanSoModules(pid, libFilter, includeAnon, includeSystem)
+							if err != nil {
+								log.Printf("[!] scan failed for pid %d: %v", pid, err)
+								continue
+							}
+							log.Printf("[+] pid %d: found %d candidate module(s)", pid, len(mods))
+							dumped = append(dumped, DumpSoModules(pid, mods, outputDir)...)
+						}
 					}
 
 					if autoFix && len(dumped) > 0 {

@@ -12,7 +12,7 @@ Android in-memory DEX dumper powered by eBPF technology.
 - **Passive dump**: Non-intrusive memory analysis
 - **Real-time tracing**: Optional method execution monitoring
 - **Automatic fixing**: Built-in DEX file repair functionality
-- **Native-layer dumping**: Dump .so libraries straight out of process memory (including self-mapped anonymous ELF images), automatically rebuilding a full section header table from the `.dynamic` segment so IDA/Ghidra recognize symbols, imports/exports and relocations
+- **Native-layer dump & fix**: Dump .so libraries straight out of process memory (including self-mapped anonymous ELF images) and rebuild a full section header table from the `.dynamic` segment so IDA/Ghidra recognize symbols, imports/exports and relocations. Handles **ARM64/ELF64 and ARM32/ELF32**, **Android packed relocations** (APS2 / RELR), can **watch for runtime decryption**, and skips firmware libraries by default
 - **High performance**: Lock-free caching and optimized string processing
 - **Simplified operation**: Smart defaults, dump and fix in one command
 
@@ -102,7 +102,7 @@ Scan a directory for dumped DEX files and fix headers/structures for readability
 ```
 
 ### `dumpso` Command
-Dump native .so libraries from a target process's memory. Unlike `dump`, this does not rely on eBPF/uprobes: it parses the target process's `/proc/<pid>/maps` directly, merges a library's separately-mapped segments (r--/r-x/rw-) back into one contiguous image, and reads it out via `process_vm_readv`. By default it also scans path-less (anonymous) memory regions and treats any whose first page starts with the ELF magic (`\x7fELF`) as a self-mapped/self-decrypted library to dump as well - useful against apps whose native-layer hardening/VMP doesn't load libraries through the normal dynamic linker path. You must provide either `--uid` or `--name` to select the target process(es).
+Dump native .so libraries from a target process's memory. Unlike `dump`, this does not rely on eBPF/uprobes: it parses the target process's `/proc/<pid>/maps` directly, merges a library's separately-mapped segments (r--/r-x/rw-) back into one contiguous image, and reads it out via `process_vm_readv`. By default it also scans path-less (anonymous) memory regions and treats any whose first page starts with the ELF magic (`\x7fELF`) as a self-mapped/self-decrypted library to dump as well - useful against apps whose native-layer hardening/VMP doesn't load libraries through the normal dynamic linker path. You must provide either `--uid` or `--name` to select the target process(es). Firmware-partition libraries under `/system`, `/apex`, `/vendor` are skipped by default (they can be pulled off the device image); use `--include-system` to keep them. For hardeners that only decrypt and map a library at runtime, `--watch` keeps polling the process and dumps each new module the moment it appears.
 
 **Options:**
 - `--uid, -u <uid>` - Filter by UID (alternative to `--name`)
@@ -113,6 +113,10 @@ Dump native .so libraries from a target process's memory. Unlike `dump`, this do
 - `--auto-fix, -f` - Automatically fix dumped .so files after dumping (default: **true**)
 - `--no-anon` - Disable anonymous ELF region scanning
 - `--no-auto-fix` - Disable automatic .so fixing
+- `--include-system` - Also dump system libraries under `/system`, `/apex`, `/vendor` (skipped by default)
+- `--watch, -w` - Keep watching the process and dump modules as they appear (captures runtime-decrypted libs)
+- `--watch-interval <sec>` - Seconds between map re-scans in `--watch` mode (default: 1)
+- `--watch-timeout <sec>` - Stop `--watch` after N seconds (0 = until interrupted, default: 60)
 
 **Examples:**
 ```bash
@@ -124,6 +128,9 @@ Dump native .so libraries from a target process's memory. Unlike `dump`, this do
 
 # Skip anonymous ELF scanning, only handle normally-linked libraries
 ./eBPFDexDumper dumpso -n com.example.app --no-anon
+
+# Watch for 120s to catch a runtime-decrypted, self-mapped hardened .so
+./eBPFDexDumper dumpso -n com.example.app --watch --watch-timeout 120
 ```
 
 **Output Files:**
@@ -133,7 +140,7 @@ Dump native .so libraries from a target process's memory. Unlike `dump`, this do
 ### `fixso` Command
 Scan a directory for dumped .so files and repair them so IDA recognizes them.
 
-The approach is inspired by [SoFixer](https://github.com/F8LEFT/SoFixer) but rewritten for ARM64/ELF64: a memory-dumped .so has lost its section header table (the loader never maps it), so IDA can only load it via program headers and misses many symbols/PLT/GOT entries. This tool first normalizes each `PT_LOAD` segment's `p_offset` to `p_vaddr`, then **parses the `PT_DYNAMIC` segment** and reconstructs the addresses and sizes of `.dynsym`/`.dynstr`/`.rela.dyn`/`.rela.plt`/`.relr.dyn`/`.dynamic` and friends from the `DT_SYMTAB/STRTAB/GNU_HASH/RELA/RELR/JMPREL/PLTGOT/VERSYM/VERDEF/VERNEED/INIT_ARRAY/FINI_ARRAY` tags. Sections are sorted by address to fill in unknown sizes, each symbol's `st_shndx` (which pointed at the original layout) is remapped to the rebuilt section that contains it, and a complete section header table is appended. IDA then recognizes symbols, imports/exports and relocations just like a normal .so. If the target has no `PT_DYNAMIC` and can't be rebuilt, it falls back to only normalizing `p_offset` and zeroing the section headers.
+The approach is inspired by [SoFixer](https://github.com/F8LEFT/SoFixer) but rewritten for Android (both ARM64/ELF64 and ARM32/ELF32): a memory-dumped .so has lost its section header table (the loader never maps it), so IDA can only load it via program headers and misses many symbols/PLT/GOT entries. This tool first normalizes each `PT_LOAD` segment's `p_offset` to `p_vaddr`, then **parses the `PT_DYNAMIC` segment** and reconstructs the addresses and sizes of `.dynsym`/`.dynstr`/`.rela.dyn`/`.rela.plt`/`.relr.dyn`/`.dynamic` and friends from the `DT_SYMTAB/STRTAB/GNU_HASH/RELA/RELR/JMPREL/PLTGOT/VERSYM/VERDEF/VERNEED/INIT_ARRAY/FINI_ARRAY` tags. Sections are sorted by address to fill in unknown sizes, each symbol's `st_shndx` (which pointed at the original layout) is remapped to the rebuilt section that contains it, and a complete section header table is appended. IDA then recognizes symbols, imports/exports and relocations just like a normal .so. The whole flow handles **both ELF32 and ELF64** (picking REL vs RELA by `EI_CLASS`) and also decodes **Android packed relocations** (`DT_ANDROID_REL/RELA`, APS2), **RELR** compressed relative relocations and **VERDEF** version definitions; after rebuilding it self-checks the output with a strict ELF parser and reports how many dynamic symbols are readable. If the target has no `PT_DYNAMIC` and can't be rebuilt, it falls back to only normalizing `p_offset` and zeroing the section headers (class-aware for 32- and 64-bit alike).
 
 **Options:**
 - `--dir, -d <dir>` - Directory containing dumped .so files (required)

@@ -26,6 +26,7 @@ import "C"
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -33,6 +34,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unsafe"
 )
 
@@ -66,6 +68,21 @@ var mapsLineRe = regexp.MustCompile(`^([0-9a-fA-F]+)-([0-9a-fA-F]+)\s+([rwxsp-]{
 // like "libfoo.so.6" or "libfoo.so.1.2".
 var soSuffixRe = regexp.MustCompile(`\.so(\.[0-9]+)*$`)
 
+// systemLibPrefixes are read-only firmware/partition mounts whose libraries
+// can be pulled straight off the device image, so dumping them from memory is
+// just noise. Anonymous (self-mapped) images are never matched here.
+var systemLibPrefixes = []string{"/system/", "/apex/", "/vendor/", "/system_ext/", "/product/", "/odm/"}
+
+// isSystemLibPath reports whether path lives on one of the firmware partitions.
+func isSystemLibPath(path string) bool {
+	for _, p := range systemLibPrefixes {
+		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func parseMapEntries(content string) []mapEntry {
 	var entries []mapEntry
 	scanner := bufio.NewScanner(strings.NewReader(content))
@@ -96,7 +113,13 @@ func parseMapEntries(content string) []mapEntry {
 // A non-empty libFilter narrows file-backed modules to matching paths and,
 // since it can't match an anonymous region by name, implicitly disables
 // anonymous scanning (the caller asked for one specific library).
-func groupSoModules(entries []mapEntry, libFilter string, includeAnon bool, elfMagicAt func(addr uint64) bool) []soModule {
+//
+// Unless includeSystem is set, file-backed libraries on the firmware
+// partitions (/system, /apex, ...) are skipped since they can be pulled off
+// the device image directly; a non-empty libFilter overrides this (the caller
+// named a specific library). Anonymous self-mapped images are never filtered
+// out this way.
+func groupSoModules(entries []mapEntry, libFilter string, includeAnon, includeSystem bool, elfMagicAt func(addr uint64) bool) []soModule {
 	if libFilter != "" {
 		includeAnon = false
 	}
@@ -109,6 +132,9 @@ func groupSoModules(entries []mapEntry, libFilter string, includeAnon bool, elfM
 			continue
 		}
 		if libFilter != "" && !strings.Contains(e.path, libFilter) {
+			continue
+		}
+		if libFilter == "" && !includeSystem && isSystemLibPath(e.path) {
 			continue
 		}
 		mod, ok := byPath[e.path]
@@ -202,7 +228,7 @@ func peekIsElf(pid int, addr uint64) bool {
 }
 
 // ScanSoModules lists candidate native-library modules mapped into pid.
-func ScanSoModules(pid int, libFilter string, includeAnon bool) ([]soModule, error) {
+func ScanSoModules(pid int, libFilter string, includeAnon, includeSystem bool) ([]soModule, error) {
 	mapsPath := fmt.Sprintf("/proc/%d/maps", pid)
 	data, err := os.ReadFile(mapsPath)
 	if err != nil {
@@ -211,7 +237,7 @@ func ScanSoModules(pid int, libFilter string, includeAnon bool) ([]soModule, err
 
 	entries := parseMapEntries(string(data))
 	elfMagicAt := func(addr uint64) bool { return peekIsElf(pid, addr) }
-	return groupSoModules(entries, libFilter, includeAnon, elfMagicAt), nil
+	return groupSoModules(entries, libFilter, includeAnon, includeSystem, elfMagicAt), nil
 }
 
 // readRemoteRange reads len(buf) bytes at base in pid's memory. If the
@@ -290,4 +316,57 @@ func DumpSoModules(pid int, mods []soModule, outDir string) []string {
 		written = append(written, fname)
 	}
 	return written
+}
+
+// WatchAndDump polls the target uid's processes and dumps each newly appearing
+// module the moment it shows up, until ctx is cancelled. This captures
+// runtime-decrypted / self-mapped .so images right after a packer maps them,
+// without having to know the decrypt routine's address: a freshly decrypted
+// library surfaces as a new anonymous ELF region (or a newly loaded file) that
+// wasn't there on the previous scan. interval bounds how often maps are
+// re-scanned; each module is dumped at most once per (pid, base, end).
+func WatchAndDump(ctx context.Context, uid uint32, libFilter string, includeAnon, includeSystem bool, outDir string, interval time.Duration) []string {
+	if interval <= 0 {
+		interval = time.Second
+	}
+	var written []string
+	seen := map[string]bool{}
+
+	scan := func() {
+		pids, err := FindPidsForUID(uid)
+		if err != nil {
+			return // target may not have started yet; keep watching
+		}
+		for _, pid := range pids {
+			mods, err := ScanSoModules(pid, libFilter, includeAnon, includeSystem)
+			if err != nil {
+				continue
+			}
+			var fresh []soModule
+			for _, m := range mods {
+				key := fmt.Sprintf("%d_%x_%x", pid, m.Base, m.End)
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				fresh = append(fresh, m)
+			}
+			if len(fresh) > 0 {
+				log.Printf("[so-watch] pid %d: %d new module(s) appeared", pid, len(fresh))
+				written = append(written, DumpSoModules(pid, fresh, outDir)...)
+			}
+		}
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	scan() // capture whatever is already mapped immediately
+	for {
+		select {
+		case <-ctx.Done():
+			return written
+		case <-ticker.C:
+			scan()
+		}
+	}
 }

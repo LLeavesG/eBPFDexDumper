@@ -4,7 +4,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io/fs"
 	"log"
@@ -13,11 +12,9 @@ import (
 	"strings"
 )
 
-const (
-	elf64HeaderSize = 64
-	elf64PhdrSize   = 56
-	ptLoad          = 1
-)
+// ptLoad is the PT_LOAD program-header type. The remaining ELF constants and
+// the elfLayout helper live in so_rebuild.go (same package).
+const ptLoad = 1
 
 // FixOneSo repairs a raw memory dump of a native library so static analysis
 // tools (IDA/Ghidra/objdump) can load it. A dump built from /proc/<pid>/maps
@@ -38,11 +35,11 @@ func FixOneSo(soPath, outPath string) error {
 		return fmt.Errorf("read so: %w", err)
 	}
 
-	if len(data) < elf64HeaderSize || !bytes.Equal(data[:4], []byte{0x7f, 'E', 'L', 'F'}) {
+	if len(data) < 16 || !bytes.Equal(data[:4], []byte{0x7f, 'E', 'L', 'F'}) {
 		return fmt.Errorf("not a valid ELF file")
 	}
-	if data[4] != 2 {
-		return fmt.Errorf("only ELF64 is supported (EI_CLASS=%d)", data[4])
+	if data[4] != 1 && data[4] != 2 {
+		return fmt.Errorf("unsupported EI_CLASS=%d (want ELF32 or ELF64)", data[4])
 	}
 
 	// Preferred path: rebuild the section header table from the dynamic segment.
@@ -50,36 +47,48 @@ func FixOneSo(soPath, outPath string) error {
 		if werr := os.WriteFile(outPath, rebuilt, 0644); werr != nil {
 			return fmt.Errorf("write out: %w", werr)
 		}
+		if n, cerr := SelfCheckSo(rebuilt); cerr == nil {
+			log.Printf("[fixso] %s: rebuilt section headers, %d dynamic symbols readable", filepath.Base(outPath), n)
+		} else {
+			log.Printf("[fixso] %s: rebuilt section headers, but self-check couldn't read symbols: %v", filepath.Base(outPath), cerr)
+		}
 		return nil
 	} else {
 		log.Printf("[fixso] section rebuild unavailable for %s (%v); falling back to header-only fix", filepath.Base(soPath), rerr)
 	}
 
-	// Fallback: normalize p_offset and zero out the section header table.
-	phoff := binary.LittleEndian.Uint64(data[32:40])
-	phentsize := binary.LittleEndian.Uint16(data[54:56])
-	phnum := binary.LittleEndian.Uint16(data[56:58])
+	// Fallback: normalize p_offset and zero out the section header table,
+	// class-aware so both ELF32 and ELF64 dumps still load via program headers.
+	l := elfLayout{is64: data[4] == 2}
+	if len(data) < l.ehdrSize() {
+		return fmt.Errorf("truncated ELF header")
+	}
+	phoff := l.phoff(data)
+	phentsize := l.phentsize(data)
+	phnum := l.phnum(data)
+	if phentsize == 0 {
+		phentsize = l.phdrSize()
+	}
 	if phoff == 0 || phnum == 0 {
 		return fmt.Errorf("no program headers")
 	}
 
 	var fixed int
-	for i := 0; i < int(phnum); i++ {
-		off := int(phoff) + i*int(phentsize)
-		if off+elf64PhdrSize > len(data) {
+	for i := 0; i < phnum; i++ {
+		off := int(phoff) + i*phentsize
+		if off+l.phdrSize() > len(data) {
 			break
 		}
-		if binary.LittleEndian.Uint32(data[off:off+4]) != ptLoad {
+		ph := data[off:]
+		if l.pType(ph) != ptLoad {
 			continue
 		}
-
-		vaddr := binary.LittleEndian.Uint64(data[off+16 : off+24])
-		filesz := binary.LittleEndian.Uint64(data[off+32 : off+40])
-		memsz := binary.LittleEndian.Uint64(data[off+40 : off+48])
-
-		binary.LittleEndian.PutUint64(data[off+8:off+16], vaddr)
+		vaddr := l.pVaddr(ph)
+		filesz := l.pFilesz(ph)
+		memsz := l.pMemsz(ph)
+		l.setPOffset(ph, vaddr)
 		if memsz > filesz {
-			binary.LittleEndian.PutUint64(data[off+32:off+40], memsz)
+			l.setPFilesz(ph, memsz)
 		}
 		fixed++
 	}
@@ -88,9 +97,9 @@ func FixOneSo(soPath, outPath string) error {
 		return fmt.Errorf("no PT_LOAD segments found")
 	}
 
-	binary.LittleEndian.PutUint64(data[40:48], 0) // e_shoff
-	binary.LittleEndian.PutUint16(data[60:62], 0) // e_shnum
-	binary.LittleEndian.PutUint16(data[62:64], 0) // e_shstrndx
+	l.setShoff(data, 0)
+	l.setShnum(data, 0)
+	l.setShstrndx(data, 0)
 
 	if err := os.WriteFile(outPath, data, 0644); err != nil {
 		return fmt.Errorf("write out: %w", err)
