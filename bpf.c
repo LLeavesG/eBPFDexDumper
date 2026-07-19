@@ -246,10 +246,15 @@ bool trace_allowed(u32 pid, u32 uid)
     return true;
 }
 
-// JNINativeMethod is ABI-stable across Android versions:
+// JNINativeMethod for a 64-bit (ARM64/ELF64) process. The field offsets and the
+// 24-byte stride below assume 8-byte pointers:
 //   const char* name;      // +0
 //   const char* signature; // +8
 //   void*       fnPtr;     // +16
+// The uprobe attaches to the 64-bit lib64 libart by default, so it only fires
+// for 64-bit targets. A 32-bit (armeabi-v7a) process has a 12-byte struct with
+// 4-byte fields; there the reads below fail safe (out-of-range pointers ->
+// empty name -> dropped by the Go side) instead of emitting wrong symbols.
 #define JNI_NATIVE_METHOD_SIZE 24
 #define JNI_MAX_METHODS 512
 
@@ -262,7 +267,11 @@ bool trace_allowed(u32 pid, u32 uid)
 SEC("uprobe/libart_registerNatives")
 int uprobe_libart_registerNatives(struct pt_regs *ctx)
 {
-    u32 pid = bpf_get_current_pid_tgid();
+    // Use the TGID (process id), not the low-32 TID: writeJniSymbols resolves
+    // fn_ptr against /proc/<pid>/maps later, at Stop. A registering worker
+    // thread may have exited by then, but the thread-group leader (tgid) lives
+    // for the whole process and shares the same address space.
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (!trace_allowed(0, bpf_get_current_uid_gid())) {
         return 0;
     }
@@ -290,10 +299,12 @@ int uprobe_libart_registerNatives(struct pt_regs *ctx)
         if (!e) {
             continue;
         }
+        // bpf_ringbuf_reserve does not zero the record; clear it so the bytes
+        // after each string's NUL aren't stale ring-buffer contents leaked to
+        // userspace (and so a failed read_user_str leaves a clean empty string).
+        __builtin_memset(e, 0, sizeof(*e));
         e->pid = pid;
         e->fn_ptr = fn_ptr;
-        e->name[0] = 0;
-        e->sig[0] = 0;
         if (name_ptr) {
             bpf_probe_read_user_str(e->name, sizeof(e->name), (void *)name_ptr);
         }

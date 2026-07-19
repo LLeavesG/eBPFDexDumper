@@ -110,13 +110,21 @@ func FixOneSo(soPath, outPath string, injected []InjectedSym) error {
 
 // FixSoDirectory scans dir for dumped .so files and writes fixed copies to
 // a "fix" subdirectory, mirroring FixDexDirectory's layout.
-func FixSoDirectory(dir string, injected []InjectedSym) error {
+//
+// injected symbols are module-relative, so they are only valid for one library.
+// symbolsTarget names that library (the module stem from a
+// jni_symbols_<stem>.txt file); symbols are injected only into the .so whose
+// name matches it, so the other dumped libraries aren't polluted with names at
+// offsets that mean nothing in their address space. An empty symbolsTarget with
+// a non-empty injected set means the origin couldn't be determined (e.g. a
+// hand-written map): fall back to injecting into every .so.
+func FixSoDirectory(dir string, injected []InjectedSym, symbolsTarget string) error {
 	fixDir := filepath.Join(dir, "fix")
 	if err := os.MkdirAll(fixDir, 0755); err != nil {
 		return fmt.Errorf("failed to create fix dir %s: %w", fixDir, err)
 	}
 
-	var count int
+	var count, injectedInto int
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -132,10 +140,20 @@ func FixSoDirectory(dir string, injected []InjectedSym) error {
 			return nil
 		}
 
+		// Route the symbol map only to its own library.
+		var syms []InjectedSym
+		if len(injected) > 0 && (symbolsTarget == "" || soMatchesModule(name, symbolsTarget)) {
+			syms = injected
+		}
+
 		outPath := filepath.Join(fixDir, strings.TrimSuffix(name, ".so")+"_fix.so")
-		if err := FixOneSo(path, outPath, injected); err != nil {
+		if err := FixOneSo(path, outPath, syms); err != nil {
 			fmt.Fprintf(os.Stdout, "[!] Fix failed for %s: %v\n", path, err)
 			return nil
+		}
+		if len(syms) > 0 {
+			injectedInto++
+			log.Printf("[+] Injected %d symbol(s) into %s", len(syms), name)
 		}
 		fmt.Fprintf(os.Stdout, "[+] Wrote %s\n", outPath)
 		count++
@@ -147,8 +165,20 @@ func FixSoDirectory(dir string, injected []InjectedSym) error {
 	if count == 0 {
 		return fmt.Errorf("no .so files found in %s", dir)
 	}
+	if len(injected) > 0 && symbolsTarget != "" && injectedInto == 0 {
+		log.Printf("[!] Symbol map targets module %q but no matching .so was found in %s; no symbols injected", symbolsTarget, dir)
+	}
 	log.Printf("[+] Fixed %d .so file(s)", count)
 	return nil
+}
+
+// soMatchesModule reports whether a dumped .so file belongs to module stem.
+// dumpso names files so_<pid>_<base>_<size>_<stem>.so, and JNI symbol maps are
+// jni_symbols_<stem>.txt, so the stems are compared after sanitizing; a plain
+// <stem>.so (a user-renamed file) matches too.
+func soMatchesModule(soFileName, stem string) bool {
+	base := sanitizeSoName(soFileName)
+	return base == stem || strings.HasSuffix(base, "_"+stem)
 }
 
 // parseSymbolFile reads an "offset name" map (one entry per line, blank lines
@@ -161,7 +191,7 @@ func parseSymbolFile(path string) ([]InjectedSym, error) {
 		return nil, err
 	}
 	var syms []InjectedSym
-	for _, line := range strings.Split(string(data), "\n") {
+	for lineNo, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -170,11 +200,26 @@ func parseSymbolFile(path string) ([]InjectedSym, error) {
 		if len(fields) < 2 {
 			continue
 		}
-		off, err := strconv.ParseUint(strings.TrimPrefix(fields[0], "0x"), 16, 64)
+		hexStr := strings.TrimPrefix(strings.TrimPrefix(fields[0], "0x"), "0X")
+		off, err := strconv.ParseUint(hexStr, 16, 64)
 		if err != nil {
+			log.Printf("[!] symbols %s:%d: skipping line, bad hex offset %q", filepath.Base(path), lineNo+1, fields[0])
 			continue
 		}
 		syms = append(syms, InjectedSym{Name: fields[1], Value: off})
 	}
 	return syms, nil
+}
+
+// moduleStemFromSymbolsFile extracts the module stem from a JNI symbols file
+// named jni_symbols_<stem>.txt (as written by the dump stage), so fixso can
+// inject those symbols only into the matching .so. Returns "" for any other
+// filename, letting the caller fall back to injecting into every library.
+func moduleStemFromSymbolsFile(path string) string {
+	base := filepath.Base(path)
+	const prefix = "jni_symbols_"
+	if !strings.HasPrefix(base, prefix) || !strings.HasSuffix(base, ".txt") {
+		return ""
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(base, prefix), ".txt")
 }

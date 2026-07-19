@@ -114,7 +114,7 @@ Dump native .so libraries from a target process's memory. Unlike `dump`, this do
 - `--no-anon` - Disable anonymous ELF region scanning
 - `--no-auto-fix` - Disable automatic .so fixing
 - `--include-system` - Also dump system libraries under `/system`, `/apex`, `/vendor` (skipped by default)
-- `--watch, -w` - Keep watching the process and dump modules as they appear (captures runtime-decrypted libs)
+- `--watch, -w` - Keep watching the process and dump modules as they appear, re-dumping when their contents change (e.g. in-place decryption) (captures runtime-decrypted libs)
 - `--watch-interval <sec>` - Seconds between map re-scans in `--watch` mode (default: 1)
 - `--watch-timeout <sec>` - Stop `--watch` after N seconds (0 = until interrupted, default: 60)
 
@@ -144,7 +144,7 @@ The approach is inspired by [SoFixer](https://github.com/F8LEFT/SoFixer) but rew
 
 **Options:**
 - `--dir, -d <dir>` - Directory containing dumped .so files (required)
-- `--symbols, -s <file>` - Symbol map file (`offset name` per line) to inject into a real `.symtab`; typically used to recover JNI names
+- `--symbols, -s <file>` - Symbol map file (`offset name` per line) to inject into a real `.symtab`; typically used to recover JNI names. When named `jni_symbols_<module>.txt`, the symbols are injected only into the matching .so, so the other dumped libraries in the directory aren't polluted
 
 **Example:**
 ```bash

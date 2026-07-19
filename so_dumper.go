@@ -28,6 +28,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"os"
 	"path/filepath"
@@ -318,19 +319,36 @@ func DumpSoModules(pid int, mods []soModule, outDir string) []string {
 	return written
 }
 
+// watchMaxRedumps caps how many times a single (pid, base, end) region is
+// re-dumped when its contents change, so an app that keeps writing to a mapping
+// can't drive the watcher into an unbounded re-dump loop.
+const watchMaxRedumps = 3
+
+// modWatchState tracks a region across scans: fp is a cheap fingerprint of a few
+// sampled windows, dumps is how many times it's been captured so far.
+type modWatchState struct {
+	fp    uint64
+	dumps int
+}
+
 // WatchAndDump polls the target uid's processes and dumps each newly appearing
 // module the moment it shows up, until ctx is cancelled. This captures
 // runtime-decrypted / self-mapped .so images right after a packer maps them,
 // without having to know the decrypt routine's address: a freshly decrypted
 // library surfaces as a new anonymous ELF region (or a newly loaded file) that
 // wasn't there on the previous scan. interval bounds how often maps are
-// re-scanned; each module is dumped at most once per (pid, base, end).
+// re-scanned.
+//
+// A region is dumped on first appearance and re-dumped (overwriting the earlier
+// file) whenever its sampled contents change, up to watchMaxRedumps times. This
+// catches packers that map a region and only then decrypt it in place — keying
+// on (pid, base, end) alone would freeze the too-early, still-encrypted capture.
 func WatchAndDump(ctx context.Context, uid uint32, libFilter string, includeAnon, includeSystem bool, outDir string, interval time.Duration) []string {
 	if interval <= 0 {
 		interval = time.Second
 	}
 	var written []string
-	seen := map[string]bool{}
+	seen := map[string]modWatchState{}
 
 	scan := func() {
 		pids, err := FindPidsForUID(uid)
@@ -345,14 +363,19 @@ func WatchAndDump(ctx context.Context, uid uint32, libFilter string, includeAnon
 			var fresh []soModule
 			for _, m := range mods {
 				key := fmt.Sprintf("%d_%x_%x", pid, m.Base, m.End)
-				if seen[key] {
-					continue
+				st, ok := seen[key]
+				if ok && st.dumps >= watchMaxRedumps {
+					continue // settled: stop re-reading it
 				}
-				seen[key] = true
+				fp := moduleFingerprint(pid, m)
+				if ok && st.fp == fp {
+					continue // unchanged since the last capture
+				}
+				seen[key] = modWatchState{fp: fp, dumps: st.dumps + 1}
 				fresh = append(fresh, m)
 			}
 			if len(fresh) > 0 {
-				log.Printf("[so-watch] pid %d: %d new module(s) appeared", pid, len(fresh))
+				log.Printf("[so-watch] pid %d: %d new/changed module(s)", pid, len(fresh))
 				written = append(written, DumpSoModules(pid, fresh, outDir)...)
 			}
 		}
@@ -369,4 +392,24 @@ func WatchAndDump(ctx context.Context, uid uint32, libFilter string, includeAnon
 			scan()
 		}
 	}
+}
+
+// moduleFingerprint samples a few small windows across a module's mapped span
+// and returns an FNV-1a hash of them. It is cheap enough to run on every scan
+// and changes when a packer rewrites code in place (e.g. decrypts .text), which
+// is what tells WatchAndDump to re-dump. Unreadable windows are skipped.
+func moduleFingerprint(pid int, m soModule) uint64 {
+	span := m.End - m.Base
+	if span == 0 {
+		return 0
+	}
+	h := fnv.New64a()
+	var win [256]byte
+	for _, frac := range []uint64{0, span / 4, span / 2, (span * 3) / 4} {
+		n := C.readRemoteAddr(C.pid_t(pid), unsafe.Pointer(&win[0]), C.size_t(len(win)), C.uintptr_t(m.Base+frac))
+		if int(n) > 0 {
+			h.Write(win[:int(n)])
+		}
+	}
+	return h.Sum64()
 }

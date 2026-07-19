@@ -116,7 +116,7 @@ eBPFDexDumper [命令] [选项]
 - `--no-anon` - 禁用匿名 ELF 区域扫描
 - `--no-auto-fix` - 禁用自动修复
 - `--include-system` - 同时转储 `/system`、`/apex`、`/vendor` 下的系统库(默认跳过)
-- `--watch, -w` - 持续监控进程,模块一出现就转储(捕获运行时解密的库)
+- `--watch, -w` - 持续监控进程,模块一出现就转储,内容变化(如原地解密)时再次转储(捕获运行时解密的库)
 - `--watch-interval <秒>` - `--watch` 模式下重新扫描 maps 的间隔(默认值:1)
 - `--watch-timeout <秒>` - `--watch` 运行多少秒后停止(0 = 直到中断,默认值:60)
 
@@ -146,7 +146,7 @@ eBPFDexDumper [命令] [选项]
 
 **选项:**
 - `--dir, -d <dir>` - 包含转储 .so 文件的目录(必需)
-- `--symbols, -s <file>` - 注入符号映射文件(每行 `偏移 名字`),写入真实 `.symtab`,常用于恢复 JNI 函数名
+- `--symbols, -s <file>` - 注入符号映射文件(每行 `偏移 名字`),写入真实 `.symtab`,常用于恢复 JNI 函数名。文件名形如 `jni_symbols_<模块>.txt` 时,符号只注入到名字匹配的那个 .so,不会污染同目录里的其它库
 
 **示例:**
 ```bash
