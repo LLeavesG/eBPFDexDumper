@@ -13,17 +13,18 @@
 - **实时追踪**: 可选的方法执行监控
 - **自动修复**: 内置 DEX 文件修复功能
 - **Native 层转储与修复**: 从进程内存转储 .so 动态库(含自映射的匿名 ELF 镜像),自动从 `.dynamic` 段重建完整 section header 表,让 IDA/Ghidra 直接识别符号、导入导出与重定位。支持 **ARM64/ELF64 与 ARM32/ELF32**、**Android packed 重定位**(APS2 / RELR),可 **watch 运行时解密**、按需**过滤系统库**
+- **JNI 动态注册名恢复**: `dump` 时自动定位 libart `RegisterNatives`(符号或字符串 xref),抓取动态注册的 native 方法名,经 `fixso --symbols` 注入到 dump 的 .so,供 IDA 识别
 - **高性能**: 使用无锁缓存和优化的字符串处理
 - **简化操作**: 智能默认配置，一条命令完成转储和修复
 
 **展示**: https://blog.lleavesg.top/article/eBPFDexDumper
 
 ## 支持环境
-- **测试环境**: Android 13 (Pixel 6)
+- **测试环境**: Android 13 / Android 16 (Pixel 6)
 - **架构**: ARM64
 - **要求**: 需要 Root 权限
 
-**注意**: 在其他 Android 版本上可能需要微调并重新编译。
+**注意**: 在其他 Android 版本上可能需要微调并重新编译。`RegisterNatives` / `Execute` 等偏移在未指定时会尝试自动识别。
 
 ## 先决条件
 工具默认会自动删除应用的 OAT 优化输出以避免 `cdex` 或空结果。如需手动操作：
@@ -60,6 +61,7 @@ eBPFDexDumper [命令] [选项]
 - `--no-auto-fix` - 禁用自动修复 DEX
 - `--execute-offset <value>` - art::interpreter::Execute 函数的手动偏移量（十六进制值，例如 0x12345）(不指定参数会自动寻找)
 - `--nterp-offset <value>` - ExecuteNterpImpl 函数的手动偏移量（十六进制值，例如 0x12345）(不指定参数会自动寻找)
+- `--register-natives-offset <value>` - art::JNI<>::RegisterNatives 的手动偏移量（十六进制值，例如 0x4d1ef4）(不指定参数会自动寻找；见下方 JNI 说明)
 
 **示例:**
 ```bash
@@ -83,6 +85,9 @@ eBPFDexDumper [命令] [选项]
 
 # 为特定 ART 版本使用手动偏移量
 ./eBPFDexDumper dump -n com.example.app --execute-offset 0x12345 --nterp-offset 0x67890
+
+# 手动指定 RegisterNatives 偏移（一般无需；自动识别失败时再用）
+./eBPFDexDumper dump -n com.example.app --register-natives-offset 0x4d1ef4
 ```
 
 **输出文件:**
@@ -160,16 +165,32 @@ eBPFDexDumper [命令] [选项]
 
 大量加固/正常 app 通过 `RegisterNatives` **动态注册** JNI 函数,这些函数在 .so 里没有导出符号,IDA 只显示 `sub_XXXX`。本工具在 `dump`(DEX 脱壳)运行时用 eBPF uprobe 挂 libart 的 `RegisterNatives`,抓取 `{函数指针, 方法名, 签名}`,按模块解析成 `偏移 名字` 写到输出目录的 `jni_symbols_<模块>.txt`;再用 `fixso --symbols` 注入到对应 dump 的 so,IDA 便能显示真实的 JNI 函数名。
 
+**`RegisterNatives` 偏移自动识别**(默认启用,无需手动传参),查找顺序:
+
+1. `--register-natives-offset` 手动指定(若提供)
+2. 从 libart 的符号表 / dynsym 扫描(优先 `art::JNI<false>` / mangling 含 `Lb0E`,避免挂到 CheckJNI 变体)
+3. **字符串 xref**(现代剥离版 ART 常用路径):在 libart 中定位 AOSP 警告串  
+   `This is slow, consider changing your RegisterNatives calls.`  
+   (备选: `JNI RegisterNativeMethods: attempt to register 0 native methods for `),解析 ARM64 `ADRP+ADD`/`ADR` 引用并回溯函数入口;若命中默认实现与 CheckJNI 两处,优先选择落在 `JNINativeInterface` 函数表槽位中的那个(相邻槽为 `UnregisterNatives`)
+
+自动识别失败时日志会提示 `JNI name recovery disabled`,此时可用 `--register-natives-offset` 手动指定。启动成功时可见类似输出:
+
+```text
+[+] RegisterNatives found by string xref at 0x4d1ef4
+[+] JNI RegisterNatives hook enabled (libart offset 0x4d1ef4)
+[+] Captured N JNI method(s) across M module(s); wrote jni_symbols_*.txt ...
+```
+
 ```bash
-# 1) 脱壳(同时抓 JNI 映射,生成 jni_symbols_*.txt)
+# 1) 脱壳(同时自动挂 RegisterNatives,抓 JNI 映射 → jni_symbols_*.txt)
 ./eBPFDexDumper dump -n com.example.app
 # 2) 转储 native so
 ./eBPFDexDumper dumpso -n com.example.app -o /data/local/tmp/so_out
-# 3) 修复并注入 JNI 符号
+# 3) 修复并注入 JNI 符号(文件名 jni_symbols_<模块>.txt 时只注入到同名 so)
 ./eBPFDexDumper fixso -d /data/local/tmp/so_out -s /data/local/tmp/dex_out/jni_symbols_libnative.txt
 ```
 
-> 注:eBPF 抓取依赖 ARM64 真机(需设备实测);`.symtab` 注入本身与架构无关,可注入任意来源(eBPF/Frida/手工)的 `偏移 名字` 映射。
+> 注:eBPF 抓取依赖 ARM64 设备;`.symtab` 注入本身与架构无关,可注入任意来源(eBPF/Frida/手工)的 `偏移 名字` 映射。请在目标 app **冷启动前** 先跑 `dump`,以便捕获启动阶段的 `RegisterNatives` 调用。
 
 ### 限制与后续
 

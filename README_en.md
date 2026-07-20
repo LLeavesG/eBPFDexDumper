@@ -13,17 +13,18 @@ Android in-memory DEX dumper powered by eBPF technology.
 - **Real-time tracing**: Optional method execution monitoring
 - **Automatic fixing**: Built-in DEX file repair functionality
 - **Native-layer dump & fix**: Dump .so libraries straight out of process memory (including self-mapped anonymous ELF images) and rebuild a full section header table from the `.dynamic` segment so IDA/Ghidra recognize symbols, imports/exports and relocations. Handles **ARM64/ELF64 and ARM32/ELF32**, **Android packed relocations** (APS2 / RELR), can **watch for runtime decryption**, and skips firmware libraries by default
+- **JNI dynamic-registration name recovery**: During `dump`, automatically locate libart's `RegisterNatives` (symbol or string xref), capture dynamically registered native method names, and inject them into dumped .so files via `fixso --symbols` for IDA
 - **High performance**: Lock-free caching and optimized string processing
 - **Simplified operation**: Smart defaults, dump and fix in one command
 
 **Showcase**: https://blog.lleavesg.top/article/eBPFDexDumper
 
 ## Supported Environment
-- **Tested on**: Android 13 (Pixel 6)
+- **Tested on**: Android 13 / Android 16 (Pixel 6)
 - **Architecture**: ARM64
 - **Requirements**: Root permission required
 
-**Note**: On other Android versions you may need minor adjustments and rebuild.
+**Note**: On other Android versions you may need minor adjustments and rebuild. Offsets such as `RegisterNatives` / `Execute` are auto-detected when not specified manually.
 
 ## Prerequisites
 The tool automatically removes the app's OAT optimization output to avoid `cdex` or empty results. For manual operation:
@@ -58,8 +59,9 @@ Attach uprobes to libart and stream DEX/method events. You must provide either `
 - `--auto-fix, -f` - Automatically fix DEX files after dumping (default: **true**)
 - `--no-clean-oat` - Disable automatic OAT cleaning
 - `--no-auto-fix` - Disable automatic DEX fixing
-- `--execute-offset <value>` - Manual offset for art::interpreter::Execute function (hex value, e.g. 0x12345)
-- `--nterp-offset <value>` - Manual offset for ExecuteNterpImpl function (hex value, e.g. 0x12345)
+- `--execute-offset <value>` - Manual offset for art::interpreter::Execute function (hex value, e.g. 0x12345) (auto-detected when omitted)
+- `--nterp-offset <value>` - Manual offset for ExecuteNterpImpl function (hex value, e.g. 0x12345) (auto-detected when omitted)
+- `--register-natives-offset <value>` - Manual offset for art::JNI<>::RegisterNatives (hex value, e.g. 0x4d1ef4) (auto-detected when omitted; see JNI section below)
 
 **Examples:**
 ```bash
@@ -83,6 +85,9 @@ Attach uprobes to libart and stream DEX/method events. You must provide either `
 
 # Use manual offsets for specific ART versions
 ./eBPFDexDumper dump -n com.example.app --execute-offset 0x12345 --nterp-offset 0x67890
+
+# Manually set RegisterNatives offset (usually unnecessary; use when auto-detect fails)
+./eBPFDexDumper dump -n com.example.app --register-natives-offset 0x4d1ef4
 ```
 
 **Output Files:**
@@ -158,16 +163,32 @@ The approach is inspired by [SoFixer](https://github.com/F8LEFT/SoFixer) but rew
 
 Many hardeners (and ordinary apps) register JNI functions **dynamically** via `RegisterNatives`; those functions carry no export symbol in the .so, so IDA only shows `sub_XXXX`. During `dump` (DEX unpacking) this tool attaches an eBPF uprobe to libart's `RegisterNatives`, captures `{fnPtr, method name, signature}`, resolves each to a module offset, and writes `jni_symbols_<module>.txt` under the output dir. Feed that to `fixso --symbols` to inject the names, and IDA shows the real JNI function names.
 
+**`RegisterNatives` offset auto-detection** (on by default; no flag required). Lookup order:
+
+1. `--register-natives-offset` if provided
+2. Scan libart's symbol / dynsym tables (prefer `art::JNI<false>` / mangled names containing `Lb0E`, so CheckJNI is not attached by mistake)
+3. **String xref** (typical path on modern stripped ART): locate the AOSP warning string  
+   `This is slow, consider changing your RegisterNatives calls.`  
+   (fallback: `JNI RegisterNativeMethods: attempt to register 0 native methods for `), resolve ARM64 `ADRP+ADD`/`ADR` refs and walk back to the function entry; when both the default and CheckJNI instantiations match, prefer the one that sits in a `JNINativeInterface` table slot (neighbor slot = `UnregisterNatives`)
+
+If auto-detection fails, the log prints `JNI name recovery disabled`; pass `--register-natives-offset` manually. On success you should see something like:
+
+```text
+[+] RegisterNatives found by string xref at 0x4d1ef4
+[+] JNI RegisterNatives hook enabled (libart offset 0x4d1ef4)
+[+] Captured N JNI method(s) across M module(s); wrote jni_symbols_*.txt ...
+```
+
 ```bash
-# 1) Unpack (also captures the JNI map into jni_symbols_*.txt)
+# 1) Unpack (also auto-hooks RegisterNatives → jni_symbols_*.txt)
 ./eBPFDexDumper dump -n com.example.app
 # 2) Dump native .so
 ./eBPFDexDumper dumpso -n com.example.app -o /data/local/tmp/so_out
-# 3) Fix and inject JNI symbols
+# 3) Fix and inject JNI symbols (a jni_symbols_<module>.txt file is applied only to the matching .so)
 ./eBPFDexDumper fixso -d /data/local/tmp/so_out -s /data/local/tmp/dex_out/jni_symbols_libnative.txt
 ```
 
-> Note: the eBPF capture side needs an ARM64 device to run (verify on-device); the `.symtab` injection itself is architecture-independent and accepts an `offset name` map from any source (eBPF/Frida/manual).
+> Note: the eBPF capture side needs an ARM64 device; the `.symtab` injection itself is architecture-independent and accepts an `offset name` map from any source (eBPF/Frida/manual). Start `dump` **before** a cold start of the target app so startup-time `RegisterNatives` calls are captured.
 
 ### Limitations & future work
 
