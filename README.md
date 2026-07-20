@@ -5,7 +5,7 @@
 
 [中文](README.md) | [English](README_en.md)
 
-基于 eBPF 技术的 Android 内存 DEX 转储工具。
+基于 eBPF 与进程内存读取的 Android 内存脱壳 / 分析工具：转储并修复 **DEX** 与 **native .so**，并可恢复动态注册的 **JNI** 符号。
 
 ## 特性
 - **不可检测**: 使用 eBPF 探针进行隐蔽操作
@@ -15,7 +15,7 @@
 - **Native 层转储与修复**: 从进程内存转储 .so 动态库(含自映射的匿名 ELF 镜像),自动从 `.dynamic` 段重建完整 section header 表,让 IDA/Ghidra 直接识别符号、导入导出与重定位。支持 **ARM64/ELF64 与 ARM32/ELF32**、**Android packed 重定位**(APS2 / RELR),可 **watch 运行时解密**、按需**过滤系统库**
 - **JNI 动态注册名恢复**: `dump` 时自动定位 libart `RegisterNatives`(符号或字符串 xref),抓取动态注册的 native 方法名,经 `fixso --symbols` 注入到 dump 的 .so,供 IDA 识别
 - **高性能**: 使用无锁缓存和优化的字符串处理
-- **简化操作**: 智能默认配置，一条命令完成转储和修复
+- **简化操作**: 智能默认配置；`dump` / `dumpso` 可自动修复，JNI 偏移默认可自动识别
 
 **展示**: https://blog.lleavesg.top/article/eBPFDexDumper
 
@@ -27,11 +27,11 @@
 **注意**: 在其他 Android 版本上可能需要微调并重新编译。`RegisterNatives` / `Execute` 等偏移在未指定时会尝试自动识别。
 
 ## 先决条件
-工具默认会自动删除应用的 OAT 优化输出以避免 `cdex` 或空结果。如需手动操作：
+`dump` 默认会自动删除应用的 OAT 优化输出，以避免 `cdex` 或空结果。如需手动操作：
 - 查找基础路径: `pm path <package>`
 - 删除 oat 文件夹: 删除 `/data/app/.../<package>/` 下的应用 `oat/` 目录
 
-通常需要 Root 权限来附加探针和读取目标内存。
+通常需要 Root 权限：附加 eBPF uprobe（`dump`）、读取目标进程 `/proc/<pid>/maps` 与内存（`dump` / `dumpso`）。
 
 ## 使用方法
 

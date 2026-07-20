@@ -5,7 +5,7 @@
 
 [中文](README.md) | [English](README_en.md)
 
-Android in-memory DEX dumper powered by eBPF technology.
+Android in-memory unpacking / analysis toolkit powered by eBPF and process memory reads: dump and fix **DEX** and native **.so** images, and recover dynamically registered **JNI** symbols.
 
 ## Features
 - **Undetectable**: Uses eBPF uprobes for stealth operation
@@ -15,7 +15,7 @@ Android in-memory DEX dumper powered by eBPF technology.
 - **Native-layer dump & fix**: Dump .so libraries straight out of process memory (including self-mapped anonymous ELF images) and rebuild a full section header table from the `.dynamic` segment so IDA/Ghidra recognize symbols, imports/exports and relocations. Handles **ARM64/ELF64 and ARM32/ELF32**, **Android packed relocations** (APS2 / RELR), can **watch for runtime decryption**, and skips firmware libraries by default
 - **JNI dynamic-registration name recovery**: During `dump`, automatically locate libart's `RegisterNatives` (symbol or string xref), capture dynamically registered native method names, and inject them into dumped .so files via `fixso --symbols` for IDA
 - **High performance**: Lock-free caching and optimized string processing
-- **Simplified operation**: Smart defaults, dump and fix in one command
+- **Simplified operation**: Smart defaults; `dump` / `dumpso` can auto-fix, and JNI offsets are auto-detected by default
 
 **Showcase**: https://blog.lleavesg.top/article/eBPFDexDumper
 
@@ -27,11 +27,11 @@ Android in-memory DEX dumper powered by eBPF technology.
 **Note**: On other Android versions you may need minor adjustments and rebuild. Offsets such as `RegisterNatives` / `Execute` are auto-detected when not specified manually.
 
 ## Prerequisites
-The tool automatically removes the app's OAT optimization output to avoid `cdex` or empty results. For manual operation:
+For `dump`, the tool automatically removes the app's OAT optimization output to avoid `cdex` or empty results. For manual operation:
 - Find base path: `pm path <package>`
 - Remove oat folder: delete the app's `oat/` directory under `/data/app/.../<package>/`
 
-Root permission is typically required to attach uprobes and read target memory.
+Root is typically required to attach eBPF uprobes (`dump`) and to read the target's `/proc/<pid>/maps` and memory (`dump` / `dumpso`).
 
 ## Usage
 
