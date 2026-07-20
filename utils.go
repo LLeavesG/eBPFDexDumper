@@ -630,3 +630,54 @@ func FindArtOffsets(libArtPath string, manualExecuteOffset, manualNterpOffset ui
 	}
 	return offsetExecute, offsetExecuteNterp, offsetVerifyClass, nil
 }
+
+// FindRegisterNativesOffset locates art::JNI<>::RegisterNatives in libart by
+// symbol (the mangled name contains 3art, 3JNI and 15RegisterNatives). Returns
+// 0 if it can't be found, in which case JNI name recovery is simply skipped.
+// manualOffset (non-zero) overrides auto-detection.
+//
+// Modern ART defines the JNI entrypoints as template<bool kEnableIndexIds>
+// class JNI, so *two* symbols match the pattern: art::JNI<false> (mangled
+// ...3JNIILb0EE..., the table the runtime dispatches to by default) and
+// art::JNI<true> (...3JNIILb1EE..., the CheckJNI variant). Attaching to the
+// <true> one captures nothing under the default config, so prefer the <false>
+// (Lb0E) instantiation and only fall back to any match if it isn't present.
+func FindRegisterNativesOffset(libArtPath string, manualOffset uint64) uint64 {
+	if manualOffset != 0 {
+		return manualOffset
+	}
+	f, err := elf.Open(libArtPath)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	scan := func(syms []elf.Symbol) uint64 {
+		var fallback uint64
+		for _, sym := range syms {
+			n := sym.Name
+			if !strings.Contains(n, "3art") || !strings.Contains(n, "3JNI") || !strings.Contains(n, "15RegisterNatives") {
+				continue
+			}
+			// art::JNI<false> — the instantiation the runtime actually calls.
+			if strings.Contains(n, "Lb0E") {
+				return sym.Value
+			}
+			if fallback == 0 {
+				fallback = sym.Value
+			}
+		}
+		return fallback
+	}
+	if syms, err := f.Symbols(); err == nil {
+		if v := scan(syms); v != 0 {
+			return v
+		}
+	}
+	if dyn, err := f.DynamicSymbols(); err == nil {
+		if v := scan(dyn); v != 0 {
+			return v
+		}
+	}
+	return 0
+}

@@ -29,6 +29,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -78,6 +79,20 @@ type DexDumper struct {
 	methodTaskChan chan methodTask
 	workerWg       sync.WaitGroup
 	stopped        atomic.Bool
+
+	// JNI RegisterNatives capture: names for dynamically-registered native
+	// methods, resolved to module offsets and written out at Stop.
+	jniMu      sync.Mutex
+	jniMethods []jniMethod
+}
+
+// jniMethod is one captured RegisterNatives entry. fnPtr is an absolute runtime
+// address, later resolved to a module-relative offset when symbols are written.
+type jniMethod struct {
+	pid   uint32
+	fnPtr uint64
+	name  string
+	sig   string
 }
 
 // JSON导出条目
@@ -227,6 +242,22 @@ func (dd *DexDumper) setupManager() error {
 		})
 	}
 
+	// RegisterNatives hook for JNI name recovery (best-effort: skipped when the
+	// symbol can't be located in libart, e.g. a stripped build).
+	if regNativesOff := FindRegisterNativesOffset(dd.libArtPath, 0); regNativesOff != 0 {
+		probes = append(probes, &manager.Probe{
+			UID:              "registerNatives",
+			EbpfFuncName:     "uprobe_libart_registerNatives",
+			Section:          "uprobe/libart_registerNatives",
+			BinaryPath:       dd.libArtPath,
+			UAddress:         regNativesOff,
+			AttachToFuncName: "RegisterNatives",
+		})
+		log.Printf("[+] JNI RegisterNatives hook enabled (libart offset 0x%x)", regNativesOff)
+	} else {
+		log.Printf("[-] RegisterNatives symbol not found in libart; JNI name recovery disabled")
+	}
+
 	dd.manager = &manager.Manager{
 		Probes: probes,
 		RingbufMaps: []*manager.RingbufMap{
@@ -260,6 +291,14 @@ func (dd *DexDumper) setupManager() error {
 				},
 				RingbufMapOptions: manager.RingbufMapOptions{
 					DataHandler: dd.handleReadFailureEventRingBuf,
+				},
+			},
+			{
+				Map: manager.Map{
+					Name: "jni_events",
+				},
+				RingbufMapOptions: manager.RingbufMapOptions{
+					DataHandler: dd.handleJniEventRingBuf,
 				},
 			},
 		},
@@ -339,6 +378,7 @@ func (dd *DexDumper) Stop() error {
 	dd.workerWg.Wait()
 
 	dd.flushJSON()
+	dd.writeJniSymbols()
 
 	// 自动修复DEX文件
 	if dd.autoFix {
@@ -614,6 +654,94 @@ func (dd *DexDumper) handleDexChunkEventRingBuf(CPU int, data []byte, ringBuf *m
 		return
 	}
 	dd.pendingDexMu.Unlock()
+}
+
+// handleJniEventRingBuf receives one RegisterNatives entry and records it for
+// later resolution to a module offset.
+func (dd *DexDumper) handleJniEventRingBuf(CPU int, data []byte, ringBuf *manager.RingbufMap, mgr *manager.Manager) {
+	if len(data) < int(unsafe.Sizeof(bpfJniMethodEventT{})) {
+		return
+	}
+	evt := bpfJniMethodEventT{}
+	if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, &evt); err != nil {
+		return
+	}
+	name := goCStr(evt.Name[:])
+	if name == "" {
+		return
+	}
+	dd.jniMu.Lock()
+	dd.jniMethods = append(dd.jniMethods, jniMethod{pid: evt.Pid, fnPtr: evt.FnPtr, name: name, sig: goCStr(evt.Sig[:])})
+	dd.jniMu.Unlock()
+}
+
+// goCStr converts a NUL-terminated int8 buffer (as generated for eBPF char[]
+// event fields) to a Go string.
+func goCStr(b []int8) string {
+	n := 0
+	for n < len(b) && b[n] != 0 {
+		n++
+	}
+	out := make([]byte, n)
+	for i := 0; i < n; i++ {
+		out[i] = byte(b[i])
+	}
+	return string(out)
+}
+
+// writeJniSymbols resolves each captured JNI function pointer to the module that
+// owns it (via that process's /proc/<pid>/maps) and writes per-module
+// "offset name" files ready for `fixso --symbols`, plus a raw capture. Called at
+// Stop; a no-op if nothing was captured.
+func (dd *DexDumper) writeJniSymbols() {
+	dd.jniMu.Lock()
+	methods := append([]jniMethod(nil), dd.jniMethods...)
+	dd.jniMu.Unlock()
+	if len(methods) == 0 {
+		return
+	}
+
+	modCache := map[uint32][]soModule{}
+	getMods := func(pid uint32) []soModule {
+		if m, ok := modCache[pid]; ok {
+			return m
+		}
+		var mods []soModule
+		if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/maps", pid)); err == nil {
+			mods = groupSoModules(parseMapEntries(string(data)), "", true, true, func(a uint64) bool { return peekIsElf(int(pid), a) })
+		}
+		modCache[pid] = mods
+		return mods
+	}
+
+	perMod := map[string]*bytes.Buffer{}
+	raw := &bytes.Buffer{}
+	seen := map[string]bool{}
+	for _, m := range methods {
+		key := fmt.Sprintf("%d_%x", m.pid, m.fnPtr)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		fmt.Fprintf(raw, "%d 0x%x %s %s\n", m.pid, m.fnPtr, m.name, m.sig)
+		for _, mod := range getMods(m.pid) {
+			if m.fnPtr >= mod.Base && m.fnPtr < mod.End {
+				b := perMod[mod.Name]
+				if b == nil {
+					b = &bytes.Buffer{}
+					perMod[mod.Name] = b
+				}
+				fmt.Fprintf(b, "0x%x %s\n", m.fnPtr-mod.Base, m.name)
+				break
+			}
+		}
+	}
+
+	_ = os.WriteFile(filepath.Join(outputPath, "jni_symbols_raw.txt"), raw.Bytes(), 0644)
+	for name, b := range perMod {
+		_ = os.WriteFile(filepath.Join(outputPath, "jni_symbols_"+sanitizeSoName(name)+".txt"), b.Bytes(), 0644)
+	}
+	log.Printf("[+] Captured %d JNI method(s) across %d module(s); wrote jni_symbols_*.txt under %s (feed to: fixso --symbols)", len(seen), len(perMod), outputPath)
 }
 
 func (dd *DexDumper) handleReadFailureEventRingBuf(CPU int, data []byte, ringBuf *manager.RingbufMap, mgr *manager.Manager) {

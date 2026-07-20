@@ -12,6 +12,7 @@ Android in-memory DEX dumper powered by eBPF technology.
 - **Passive dump**: Non-intrusive memory analysis
 - **Real-time tracing**: Optional method execution monitoring
 - **Automatic fixing**: Built-in DEX file repair functionality
+- **Native-layer dump & fix**: Dump .so libraries straight out of process memory (including self-mapped anonymous ELF images) and rebuild a full section header table from the `.dynamic` segment so IDA/Ghidra recognize symbols, imports/exports and relocations. Handles **ARM64/ELF64 and ARM32/ELF32**, **Android packed relocations** (APS2 / RELR), can **watch for runtime decryption**, and skips firmware libraries by default
 - **High performance**: Lock-free caching and optimized string processing
 - **Simplified operation**: Smart defaults, dump and fix in one command
 
@@ -41,6 +42,8 @@ eBPFDexDumper [command] [options]
 **Available Commands:**
 - `dump` - Start eBPF-based DEX dumper
 - `fix` - Fix dumped DEX files in a directory
+- `dumpso` - Dump native .so libraries from a running process's memory
+- `fixso` - Fix dumped .so files in a directory
 
 ### `dump` Command
 Attach uprobes to libart and stream DEX/method events. You must provide either `--uid` or `--name` to filter the target app.
@@ -97,6 +100,79 @@ Scan a directory for dumped DEX files and fix headers/structures for readability
 ```bash
 ./eBPFDexDumper fix -d /data/local/tmp/out
 ```
+
+### `dumpso` Command
+Dump native .so libraries from a target process's memory. Unlike `dump`, this does not rely on eBPF/uprobes: it parses the target process's `/proc/<pid>/maps` directly, merges a library's separately-mapped segments (r--/r-x/rw-) back into one contiguous image, and reads it out via `process_vm_readv`. By default it also scans path-less (anonymous) memory regions and treats any whose first page starts with the ELF magic (`\x7fELF`) as a self-mapped/self-decrypted library to dump as well - useful against apps whose native-layer hardening/VMP doesn't load libraries through the normal dynamic linker path. You must provide either `--uid` or `--name` to select the target process(es). Firmware-partition libraries under `/system`, `/apex`, `/vendor` are skipped by default (they can be pulled off the device image); use `--include-system` to keep them. For hardeners that only decrypt and map a library at runtime, `--watch` keeps polling the process and dumps each new module the moment it appears.
+
+**Options:**
+- `--uid, -u <uid>` - Filter by UID (alternative to `--name`)
+- `--name, -n <package>` - Android package name to derive UID (alternative to `--uid`)
+- `--lib, -l <substr>` - Only dump libraries whose path contains this substring (default: all app-mapped .so files)
+- `--out, -o, --output <dir>` - Output directory on device (default: `/data/local/tmp/so_out`)
+- `--anon, -a` - Also scan anonymous memory regions for self-mapped ELF images (default: **true**)
+- `--auto-fix, -f` - Automatically fix dumped .so files after dumping (default: **true**)
+- `--no-anon` - Disable anonymous ELF region scanning
+- `--no-auto-fix` - Disable automatic .so fixing
+- `--include-system` - Also dump system libraries under `/system`, `/apex`, `/vendor` (skipped by default)
+- `--watch, -w` - Keep watching the process and dump modules as they appear, re-dumping when their contents change (e.g. in-place decryption) (captures runtime-decrypted libs)
+- `--watch-interval <sec>` - Seconds between map re-scans in `--watch` mode (default: 1)
+- `--watch-timeout <sec>` - Stop `--watch` after N seconds (0 = until interrupted, default: 60)
+
+**Examples:**
+```bash
+# Simplest usage - dump every .so mapped by the app's process(es), auto-fix
+./eBPFDexDumper dumpso -n com.example.app
+
+# Dump one specific library
+./eBPFDexDumper dumpso -n com.example.app -l libnative-lib.so
+
+# Skip anonymous ELF scanning, only handle normally-linked libraries
+./eBPFDexDumper dumpso -n com.example.app --no-anon
+
+# Watch for 120s to catch a runtime-decrypted, self-mapped hardened .so
+./eBPFDexDumper dumpso -n com.example.app --watch --watch-timeout 120
+```
+
+**Output Files:**
+- **Raw .so**: `so_<pid>_<base>_<size>_<name>.so` saved under the output directory
+- **Fixed .so**: `fix/so_<pid>_<base>_<size>_<name>_fix.so`, with a full section header table rebuilt so it drops straight into IDA/Ghidra
+
+### `fixso` Command
+Scan a directory for dumped .so files and repair them so IDA recognizes them.
+
+The approach is inspired by [SoFixer](https://github.com/F8LEFT/SoFixer) but rewritten for Android (both ARM64/ELF64 and ARM32/ELF32): a memory-dumped .so has lost its section header table (the loader never maps it), so IDA can only load it via program headers and misses many symbols/PLT/GOT entries. This tool first normalizes each `PT_LOAD` segment's `p_offset` to `p_vaddr`, then **parses the `PT_DYNAMIC` segment** and reconstructs the addresses and sizes of `.dynsym`/`.dynstr`/`.rela.dyn`/`.rela.plt`/`.relr.dyn`/`.dynamic` and friends from the `DT_SYMTAB/STRTAB/GNU_HASH/RELA/RELR/JMPREL/PLTGOT/VERSYM/VERDEF/VERNEED/INIT_ARRAY/FINI_ARRAY` tags. Sections are sorted by address to fill in unknown sizes, each symbol's `st_shndx` (which pointed at the original layout) is remapped to the rebuilt section that contains it, and a complete section header table is appended. IDA then recognizes symbols, imports/exports and relocations just like a normal .so. The whole flow handles **both ELF32 and ELF64** (picking REL vs RELA by `EI_CLASS`) and also decodes **Android packed relocations** (`DT_ANDROID_REL/RELA`, APS2), **RELR** compressed relative relocations and **VERDEF** version definitions; after rebuilding it self-checks the output with a strict ELF parser and reports how many dynamic symbols are readable. If the target has no `PT_DYNAMIC` and can't be rebuilt, it falls back to only normalizing `p_offset` and zeroing the section headers (class-aware for 32- and 64-bit alike).
+
+**Options:**
+- `--dir, -d <dir>` - Directory containing dumped .so files (required)
+- `--symbols, -s <file>` - Symbol map file (`offset name` per line) to inject into a real `.symtab`; typically used to recover JNI names. When named `jni_symbols_<module>.txt`, the symbols are injected only into the matching .so, so the other dumped libraries in the directory aren't polluted
+
+**Example:**
+```bash
+./eBPFDexDumper fixso -d /data/local/tmp/so_out
+
+# Inject JNI symbols captured during dumping so IDA shows real function names
+./eBPFDexDumper fixso -d /data/local/tmp/so_out -s /data/local/tmp/dex_out/jni_symbols_libxxx.txt
+```
+
+### JNI symbol recovery (dynamic registration)
+
+Many hardeners (and ordinary apps) register JNI functions **dynamically** via `RegisterNatives`; those functions carry no export symbol in the .so, so IDA only shows `sub_XXXX`. During `dump` (DEX unpacking) this tool attaches an eBPF uprobe to libart's `RegisterNatives`, captures `{fnPtr, method name, signature}`, resolves each to a module offset, and writes `jni_symbols_<module>.txt` under the output dir. Feed that to `fixso --symbols` to inject the names, and IDA shows the real JNI function names.
+
+```bash
+# 1) Unpack (also captures the JNI map into jni_symbols_*.txt)
+./eBPFDexDumper dump -n com.example.app
+# 2) Dump native .so
+./eBPFDexDumper dumpso -n com.example.app -o /data/local/tmp/so_out
+# 3) Fix and inject JNI symbols
+./eBPFDexDumper fixso -d /data/local/tmp/so_out -s /data/local/tmp/dex_out/jni_symbols_libnative.txt
+```
+
+> Note: the eBPF capture side needs an ARM64 device to run (verify on-device); the `.symtab` injection itself is architecture-independent and accepts an `offset name` map from any source (eBPF/Frida/manual).
+
+### Limitations & future work
+
+- **CompactDex (cdex)**: newer ART's compressed DEX format. This tool **detects and warns** about it but does not yet do a full `cdex→dex` conversion (CodeItems need decompression/relayout); convert with a tool like [vdexExtractor](https://github.com/anestisb/vdexExtractor) first.
+- **Active triggering for extraction-based packers**: eBPF is a **read-only** observation model — it cannot call into the target to force-decrypt methods that never execute. That kind of active unpacking needs code injection (Frida/ptrace), which is outside this tool's eBPF model. Today `dump` captures only methods that actually run.
 
 ## Installation & Build
 
