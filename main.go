@@ -75,6 +75,7 @@ OPTIONS:
 					&cli.BoolFlag{Name: "no-auto-fix", Usage: "Disable automatic DEX fixing"},
 					&cli.Uint64Flag{Name: "execute-offset", Usage: "Manual offset for art::interpreter::Execute function (hex value, e.g. 0x12345)"},
 					&cli.Uint64Flag{Name: "nterp-offset", Usage: "Manual offset for ExecuteNterpImpl function (hex value, e.g. 0x12345)"},
+					&cli.Uint64Flag{Name: "register-natives-offset", Usage: "Manual offset for art::JNI<>::RegisterNatives (hex value, e.g. 0x12345); auto-detected via symbol or string xref when omitted"},
 				},
 				Action: func(c *cli.Context) error {
 					uid := uint32(c.Uint64("uid"))
@@ -86,6 +87,7 @@ OPTIONS:
 					autoFix := c.Bool("auto-fix") && !c.Bool("no-auto-fix")
 					executeOffset := c.Uint64("execute-offset")
 					nterpOffset := c.Uint64("nterp-offset")
+					registerNativesOffset := c.Uint64("register-natives-offset")
 
 					if err := os.MkdirAll(outputDir, 0755); err != nil {
 						return fmt.Errorf("failed to create output directory %s: %w", outputDir, err)
@@ -113,7 +115,7 @@ OPTIONS:
 						}
 					}
 
-					dumper := NewDexDumper(libArtPath, uid, outputDir, trace, autoFix, executeOffset, nterpOffset)
+					dumper := NewDexDumper(libArtPath, uid, outputDir, trace, autoFix, executeOffset, nterpOffset, registerNativesOffset)
 
 					ctx, cancel := context.WithCancel(context.Background())
 					defer cancel()

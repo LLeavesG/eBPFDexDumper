@@ -57,8 +57,9 @@ type DexDumper struct {
 	uid           uint32
 	trace         bool
 	autoFix       bool
-	executeOffset uint64
-	nterpOffset   uint64
+	executeOffset         uint64
+	nterpOffset           uint64
+	registerNativesOffset uint64
 
 	// 使用sync.Map减少锁竞争
 	methodSigCache sync.Map // key: uint64(begin<<32|methodIndex), value: string
@@ -243,8 +244,8 @@ func (dd *DexDumper) setupManager() error {
 	}
 
 	// RegisterNatives hook for JNI name recovery (best-effort: skipped when the
-	// symbol can't be located in libart, e.g. a stripped build).
-	if regNativesOff := FindRegisterNativesOffset(dd.libArtPath, 0); regNativesOff != 0 {
+	// offset can't be located in libart — stripped builds fall back to string xref).
+	if regNativesOff := FindRegisterNativesOffset(dd.libArtPath, dd.registerNativesOffset); regNativesOff != 0 {
 		probes = append(probes, &manager.Probe{
 			UID:              "registerNatives",
 			EbpfFuncName:     "uprobe_libart_registerNatives",
@@ -255,7 +256,7 @@ func (dd *DexDumper) setupManager() error {
 		})
 		log.Printf("[+] JNI RegisterNatives hook enabled (libart offset 0x%x)", regNativesOff)
 	} else {
-		log.Printf("[-] RegisterNatives symbol not found in libart; JNI name recovery disabled")
+		log.Printf("[-] RegisterNatives offset not found in libart; JNI name recovery disabled")
 	}
 
 	dd.manager = &manager.Manager{
@@ -392,20 +393,21 @@ func (dd *DexDumper) Stop() error {
 
 const numWorkers = 4 // 并行处理 worker 数量
 
-func NewDexDumper(libArtPath string, uid uint32, outputDir string, trace, autoFix bool, executeOffset, nterpOffset uint64) *DexDumper {
+func NewDexDumper(libArtPath string, uid uint32, outputDir string, trace, autoFix bool, executeOffset, nterpOffset, registerNativesOffset uint64) *DexDumper {
 	outputPath = outputDir
 
 	dd := &DexDumper{
-		libArtPath:     libArtPath,
-		uid:            uid,
-		trace:          trace,
-		autoFix:        autoFix,
-		executeOffset:  executeOffset,
-		nterpOffset:    nterpOffset,
-		dexSizes:       make(map[uint64]uint32),
-		methodRecords:  make(map[uint64][]MethodCodeRecord),
-		pendingDex:     make(map[uint64]*dexRecvState),
-		methodTaskChan: make(chan methodTask, 4096), // 缓冲通道
+		libArtPath:            libArtPath,
+		uid:                   uid,
+		trace:                 trace,
+		autoFix:               autoFix,
+		executeOffset:         executeOffset,
+		nterpOffset:           nterpOffset,
+		registerNativesOffset: registerNativesOffset,
+		dexSizes:              make(map[uint64]uint32),
+		methodRecords:         make(map[uint64][]MethodCodeRecord),
+		pendingDex:            make(map[uint64]*dexRecvState),
+		methodTaskChan:        make(chan methodTask, 4096), // 缓冲通道
 	}
 
 	// 启动 worker pool

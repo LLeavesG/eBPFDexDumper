@@ -5,12 +5,14 @@ import (
 	"bytes"
 	"compress/gzip"
 	"debug/elf"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -631,21 +633,38 @@ func FindArtOffsets(libArtPath string, manualExecuteOffset, manualNterpOffset ui
 	return offsetExecute, offsetExecuteNterp, offsetVerifyClass, nil
 }
 
-// FindRegisterNativesOffset locates art::JNI<>::RegisterNatives in libart by
-// symbol (the mangled name contains 3art, 3JNI and 15RegisterNatives). Returns
-// 0 if it can't be found, in which case JNI name recovery is simply skipped.
+// FindRegisterNativesOffset locates art::JNI<>::RegisterNatives in libart.
+// Returns 0 if it can't be found, in which case JNI name recovery is skipped.
 // manualOffset (non-zero) overrides auto-detection.
 //
-// Modern ART defines the JNI entrypoints as template<bool kEnableIndexIds>
-// class JNI, so *two* symbols match the pattern: art::JNI<false> (mangled
-// ...3JNIILb0EE..., the table the runtime dispatches to by default) and
-// art::JNI<true> (...3JNIILb1EE..., the CheckJNI variant). Attaching to the
-// <true> one captures nothing under the default config, so prefer the <false>
-// (Lb0E) instantiation and only fall back to any match if it isn't present.
+// Lookup order:
+//  1. manual offset
+//  2. symbol / dynsym (un-stripped builds; prefer JNI<false>/Lb0E over CheckJNI)
+//  3. string xref — modern stripped ART no longer exports RegisterNatives, but
+//     still embeds AOSP warning strings inside the function body
+//     ("This is slow, consider changing your RegisterNatives calls.").
+//     Two template instantiations usually both reference those strings; we
+//     prefer the entry that also appears in a JNINativeInterface-like pointer
+//     table (next slot is another executable pointer = UnregisterNatives).
 func FindRegisterNativesOffset(libArtPath string, manualOffset uint64) uint64 {
 	if manualOffset != 0 {
+		log.Printf("[+] Using manual RegisterNatives offset: 0x%x", manualOffset)
 		return manualOffset
 	}
+	if off := findRegisterNativesBySymbol(libArtPath); off != 0 {
+		log.Printf("[+] RegisterNatives found by symbol at 0x%x", off)
+		return off
+	}
+	if off, err := findRegisterNativesByString(libArtPath); err == nil && off != 0 {
+		log.Printf("[+] RegisterNatives found by string xref at 0x%x", off)
+		return off
+	} else if err != nil {
+		log.Printf("[-] RegisterNatives string xref failed: %v", err)
+	}
+	return 0
+}
+
+func findRegisterNativesBySymbol(libArtPath string) uint64 {
 	f, err := elf.Open(libArtPath)
 	if err != nil {
 		return 0
@@ -680,4 +699,202 @@ func FindRegisterNativesOffset(libArtPath string, manualOffset uint64) uint64 {
 		}
 	}
 	return 0
+}
+
+// AOSP warning strings that live inside art::JNI<>::RegisterNatives
+// (runtime/jni/jni_internal.cc). Prefer the "slow" string: it is unique to
+// RegisterNatives and survives stripping.
+const (
+	regNativesSlowStr = "This is slow, consider changing your RegisterNatives calls."
+	regNativesZeroStr = "JNI RegisterNativeMethods: attempt to register 0 native methods for "
+)
+
+func findRegisterNativesByString(libArtPath string) (uint64, error) {
+	f, err := elf.Open(libArtPath)
+	if err != nil {
+		return 0, fmt.Errorf("open elf failed: %w", err)
+	}
+	defer f.Close()
+
+	codeData, codeVaddr, err := loadExecSegment(f)
+	if err != nil {
+		return 0, err
+	}
+
+	// Prefer the slow-warning string; fall back to the zero-methods warning.
+	var strAddr uint64
+	var strLabel string
+	for _, cand := range []struct{ s, label string }{
+		{regNativesSlowStr, "slow-warning"},
+		{regNativesZeroStr, "zero-methods"},
+	} {
+		addr, serr := findStringInELF(libArtPath, cand.s)
+		if serr == nil {
+			strAddr = addr
+			strLabel = cand.label
+			break
+		}
+	}
+	if strAddr == 0 {
+		return 0, fmt.Errorf("RegisterNatives warning strings not found in libart")
+	}
+	log.Printf("[+] Found RegisterNatives %s string at 0x%x", strLabel, strAddr)
+
+	refAddrs := findArm64StringRefs(codeData, codeVaddr, strAddr)
+	if len(refAddrs) == 0 {
+		return 0, fmt.Errorf("no code references to RegisterNatives string found")
+	}
+	log.Printf("[+] Found %d references to RegisterNatives string", len(refAddrs))
+
+	seen := map[uint64]struct{}{}
+	var candidates []uint64
+	for _, ref := range refAddrs {
+		entry := findFunctionEntry(codeData, codeVaddr, ref)
+		if entry == 0 {
+			continue
+		}
+		if _, ok := seen[entry]; ok {
+			continue
+		}
+		seen[entry] = struct{}{}
+		candidates = append(candidates, entry)
+	}
+	if len(candidates) == 0 {
+		return 0, fmt.Errorf("could not recover function entry from RegisterNatives string refs")
+	}
+
+	if len(candidates) == 1 {
+		return candidates[0], nil
+	}
+
+	// Two instantiations (default JNI vs CheckJNI). Prefer the one parked in a
+	// JNINativeInterface-like table: a RW qword equal to the entry whose next
+	// qword is also an executable pointer (UnregisterNatives sits right after).
+	if pick := preferRegisterNativesInJniTable(f, codeVaddr, uint64(len(codeData)), candidates); pick != 0 {
+		log.Printf("[+] Preferring RegisterNatives 0x%x (JNINativeInterface table slot)", pick)
+		return pick, nil
+	}
+	// Stable fallback: lowest address is normally the default (non-CheckJNI) impl.
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i] < candidates[j] })
+	log.Printf("[!] Multiple RegisterNatives candidates %v; using lowest 0x%x", candidates, candidates[0])
+	return candidates[0], nil
+}
+
+func loadExecSegment(f *elf.File) (data []byte, vaddr uint64, err error) {
+	for _, p := range f.Progs {
+		if p.Type != elf.PT_LOAD || (p.Flags&elf.PF_X) == 0 {
+			continue
+		}
+		rs := p.Open()
+		if rs == nil {
+			continue
+		}
+		buf, rerr := io.ReadAll(rs)
+		if rerr != nil {
+			return nil, 0, fmt.Errorf("read exec segment: %w", rerr)
+		}
+		return buf, p.Vaddr, nil
+	}
+	return nil, 0, fmt.Errorf("code segment not found")
+}
+
+// findArm64StringRefs returns PCs of ADR / ADRP+ADD sequences that materialize strAddr.
+func findArm64StringRefs(codeData []byte, codeVaddr, strAddr uint64) []uint64 {
+	var refs []uint64
+	for i := 0; i+4 <= len(codeData); i += 4 {
+		pc := codeVaddr + uint64(i)
+		inst := uint32(codeData[i]) | uint32(codeData[i+1])<<8 | uint32(codeData[i+2])<<16 | uint32(codeData[i+3])<<24
+
+		// ADRP Xd, page
+		if (inst & 0x9F000000) == 0x90000000 {
+			immlo := (inst >> 29) & 0x3
+			immhi := (inst >> 5) & 0x7FFFF
+			imm := int64((immhi<<2)|immlo) << 12
+			if (imm & (1 << 32)) != 0 {
+				imm |= ^int64(0) << 33
+			}
+			pageAddr := (pc &^ 0xFFF) + uint64(imm)
+			rd := inst & 0x1F
+
+			// Look ahead a few instructions for ADD Xd, Xd, #imm12 (optionally LSL#12).
+			for j := 1; j <= 6 && i+j*4+4 <= len(codeData); j++ {
+				off := i + j*4
+				next := uint32(codeData[off]) | uint32(codeData[off+1])<<8 | uint32(codeData[off+2])<<16 | uint32(codeData[off+3])<<24
+				if (next & 0xFF800000) != 0x91000000 {
+					continue
+				}
+				rn := (next >> 5) & 0x1F
+				if rn != rd {
+					continue
+				}
+				imm12 := (next >> 10) & 0xFFF
+				sh := (next >> 22) & 1
+				addend := uint64(imm12)
+				if sh != 0 {
+					addend <<= 12
+				}
+				if pageAddr+addend == strAddr {
+					refs = append(refs, pc)
+					break
+				}
+			}
+		}
+
+		// ADR Xd, label
+		if (inst & 0x9F000000) == 0x10000000 {
+			immlo := (inst >> 29) & 0x3
+			immhi := (inst >> 5) & 0x7FFFF
+			imm := int64((immhi << 2) | immlo)
+			if (imm & (1 << 20)) != 0 {
+				imm |= ^int64(0) << 21
+			}
+			if pc+uint64(imm) == strAddr {
+				refs = append(refs, pc)
+			}
+		}
+	}
+	return refs
+}
+
+// preferRegisterNativesInJniTable picks the candidate whose address appears as a
+// function pointer in a RW LOAD segment with an executable neighbor at +8
+// (UnregisterNatives). That matches the layout of JNINativeInterface.
+func preferRegisterNativesInJniTable(f *elf.File, codeVaddr, codeSize uint64, candidates []uint64) uint64 {
+	candSet := map[uint64]struct{}{}
+	for _, c := range candidates {
+		candSet[c] = struct{}{}
+	}
+	codeEnd := codeVaddr + codeSize
+	inExec := func(va uint64) bool { return va >= codeVaddr && va < codeEnd }
+
+	var hits []uint64
+	for _, p := range f.Progs {
+		if p.Type != elf.PT_LOAD || (p.Flags&elf.PF_W) == 0 {
+			continue
+		}
+		rs := p.Open()
+		if rs == nil {
+			continue
+		}
+		data, err := io.ReadAll(rs)
+		if err != nil || len(data) < 16 {
+			continue
+		}
+		for off := 0; off+16 <= len(data); off += 8 {
+			ptr := binary.LittleEndian.Uint64(data[off : off+8])
+			if _, ok := candSet[ptr]; !ok {
+				continue
+			}
+			next := binary.LittleEndian.Uint64(data[off+8 : off+16])
+			if inExec(next) {
+				hits = append(hits, ptr)
+			}
+		}
+	}
+	if len(hits) == 0 {
+		return 0
+	}
+	// If both default and CheckJNI tables matched, pick the lowest (default first).
+	sort.Slice(hits, func(i, j int) bool { return hits[i] < hits[j] })
+	return hits[0]
 }
