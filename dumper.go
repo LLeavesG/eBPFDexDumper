@@ -7,12 +7,17 @@ package main
 #include <sys/uio.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <errno.h>
 
-ssize_t readRemoteMem(pid_t pid, void *dst, size_t len, void *src) {
+// Remote address is uintptr_t, not void*: Go's cgocheck can panic if a remote
+// bit-pattern coincides with a local heap span when passed as unsafe.Pointer.
+ssize_t readRemoteMem(pid_t pid, void *dst, size_t len, uintptr_t src) {
     struct iovec local_iov = { dst, len };
-    struct iovec remote_iov = { src, len };
+    struct iovec remote_iov = { (void *)src, len };
     return process_vm_readv(pid, &local_iov, 1, &remote_iov, 1, 0);
 }
+
+int readRemoteErrno(void) { return errno; }
 */
 import "C"
 
@@ -759,27 +764,95 @@ func (dd *DexDumper) handleReadFailureEventRingBuf(CPU int, data []byte, ringBuf
 		return
 	}
 
-	// log.Printf("eBPF read failed at offset %d for dex 0x%x (pid=%d), using readRemoteMem fallback",
-	// 	failureEvt.FailedOffset, failureEvt.Begin, failureEvt.Pid)
+	log.Printf("[dex-fallback] eBPF read miss at offset %d for dex 0x%x (pid=%d size=%d), trying process_vm_readv",
+		failureEvt.FailedOffset, failureEvt.Begin, failureEvt.Pid, failureEvt.Size)
 
 	dd.readRemoteDexFallback(failureEvt.Begin, failureEvt.Pid, failureEvt.Size, failureEvt.FailedOffset)
 }
 
-func (dd *DexDumper) readRemoteDexFallback(begin uint64, pid uint32, totalSize uint32, startOffset uint32) {
-	buf := make([]byte, totalSize)
+// untagAddr clears TBI/PAC-style top-byte tags used by ART pointers.
+func untagAddr(addr uint64) uint64 {
+	return addr & 0x00ffffffffffffff
+}
 
-	ret := C.readRemoteMem(C.pid_t(pid), unsafe.Pointer(&buf[0]), C.size_t(totalSize),
-		unsafe.Pointer(uintptr(begin)))
+const (
+	maxDexDumpSize  = 512 * 1024 * 1024
+	minDexDumpSize  = 0x70
+	dexReadChunkSize = 4096
+)
 
-	if ret < 0 {
-		log.Printf("readRemoteMem failed for dex 0x%x: %d", begin, ret)
-		return
+// readRemoteRange reads len(buf) bytes at base from pid. Tries one contiguous
+// process_vm_readv first; on failure falls back to page-sized reads so a single
+// unreadable hole does not abandon the whole DEX.
+func readRemoteRange(pid int, base uint64, buf []byte) int {
+	if len(buf) == 0 {
+		return 0
+	}
+	n := C.readRemoteMem(C.pid_t(pid), unsafe.Pointer(&buf[0]), C.size_t(len(buf)), C.uintptr_t(base))
+	if int(n) == len(buf) {
+		return len(buf)
 	}
 
-	readSize := uint32(ret)
-	if readSize != totalSize {
-		log.Printf("readRemoteMem partial read: expected %d, got %d", totalSize, readSize)
-		buf = buf[:readSize]
+	total := 0
+	for off := 0; off < len(buf); off += dexReadChunkSize {
+		end := off + dexReadChunkSize
+		if end > len(buf) {
+			end = len(buf)
+		}
+		chunk := buf[off:end]
+		cn := C.readRemoteMem(C.pid_t(pid), unsafe.Pointer(&chunk[0]), C.size_t(len(chunk)), C.uintptr_t(base)+C.uintptr_t(off))
+		if int(cn) == len(chunk) {
+			total += len(chunk)
+		}
+	}
+	return total
+}
+
+func (dd *DexDumper) readRemoteDexFallback(begin uint64, pid uint32, totalSize uint32, startOffset uint32) {
+	begin = untagAddr(begin)
+	if totalSize < minDexDumpSize || totalSize > maxDexDumpSize {
+		log.Printf("readRemoteMem skip dex 0x%x: unreasonable size %d (pid=%d)", begin, totalSize, pid)
+		return
+	}
+	if dexCache.GetParser(begin) != nil {
+		return // already dumped/cached
+	}
+
+	buf := make([]byte, totalSize)
+	got := readRemoteRange(int(pid), begin, buf)
+	if got == 0 {
+		errno := C.readRemoteErrno()
+		log.Printf("readRemoteMem failed for dex 0x%x: got=0 errno=%d (%s) pid=%d size=%d off=%d",
+			begin, int(errno), unix.Errno(errno).Error(), pid, totalSize, startOffset)
+		return
+	}
+	if uint32(got) < totalSize {
+		log.Printf("readRemoteMem partial for dex 0x%x: %d/%d bytes (pid=%d)", begin, got, totalSize, pid)
+	}
+
+	// Prefer the on-disk/header file_size once we have a valid DEX header, so
+	// dumped length matches what tools expect ("大小不对" cases).
+	outSize := uint32(got)
+	if got >= 0x24 && bytes.HasPrefix(buf, []byte{'d', 'e', 'x', '\n'}) {
+		hdrSize := binary.LittleEndian.Uint32(buf[0x20:0x24])
+		if hdrSize >= minDexDumpSize && hdrSize <= maxDexDumpSize {
+			if hdrSize <= uint32(got) {
+				outSize = hdrSize
+				buf = buf[:hdrSize]
+			} else if hdrSize != totalSize && hdrSize <= maxDexDumpSize {
+				// Header claims more than the event size; try to extend.
+				bigger := make([]byte, hdrSize)
+				copy(bigger, buf[:got])
+				extra := readRemoteRange(int(pid), begin+uint64(got), bigger[got:])
+				if uint32(got+extra) >= hdrSize {
+					buf = bigger
+					outSize = hdrSize
+					log.Printf("[dex-fallback] resized dump 0x%x to header file_size %d", begin, hdrSize)
+				}
+			}
+		}
+	} else if got >= 4 {
+		log.Printf("[dex-fallback] warning: dex 0x%x missing magic after read (first4=%x)", begin, buf[:4])
 	}
 
 	dd.pendingDexMu.Lock()
@@ -787,14 +860,14 @@ func (dd *DexDumper) readRemoteDexFallback(begin uint64, pid uint32, totalSize u
 	dd.pendingDexMu.Unlock()
 
 	dd.dexSizesMu.Lock()
-	dd.dexSizes[begin] = totalSize
+	dd.dexSizes[begin] = outSize
 	dd.dexSizesMu.Unlock()
 
 	if err := dexCache.AddDexFile(begin, buf); err != nil {
 		log.Printf("Failed to add dex file to cache: %v", err)
 	}
 
-	fileName := fmt.Sprintf("%s/dex_%x_%x.dex", outputPath, begin, totalSize)
+	fileName := fmt.Sprintf("%s/dex_%x_%x.dex", outputPath, begin, outSize)
 	f, err := os.Create(fileName)
 	if err != nil {
 		log.Printf("Create file failed: %v", err)

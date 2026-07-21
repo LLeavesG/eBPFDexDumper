@@ -319,8 +319,9 @@ int uprobe_libart_registerNatives(struct pt_regs *ctx)
 SEC("uprobe/libart_execute")
 int uprobe_libart_execute(struct pt_regs *ctx)
 {
-
-    u32 pid = bpf_get_current_pid_tgid();
+    // TGID (process id): Go-side process_vm_readv / maps lookups need the
+    // thread-group leader, not a short-lived worker TID.
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (!trace_allowed(0, bpf_get_current_uid_gid())){
         return 0;
     }
@@ -350,16 +351,14 @@ int uprobe_libart_execute(struct pt_regs *ctx)
     u32 size = 0;
     u8 ch = 0;
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
-    bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
+    begin = (u64)untag((void *)begin);
+    bpf_probe_read_user(&size, sizeof(u32), (void *)(begin + 0x20));
 
     // read one byte to check if readable
     bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
 
-    if(begin != 0 && size != 0) {
-        if (size < 0){
-            return 0;
-        }
-
+    // Reject absurd sizes before spending ringbuf / process_vm_readv budget.
+    if(begin != 0 && size >= 0x70 && size <= (512 * 1024 * 1024)) {
         if (ch == 0x64) {
             u32 exist = 1;
             u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
@@ -389,7 +388,7 @@ int uprobe_libart_execute(struct pt_regs *ctx)
 SEC("uprobe/libart_executeNterpImpl")
 int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
 {
-    u32 pid = bpf_get_current_pid_tgid();
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (!trace_allowed(0, bpf_get_current_uid_gid())){
         return 0;
     }
@@ -414,16 +413,13 @@ int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
     u32 size = 0;
     u8 ch = 0;
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
-    bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
+    begin = (u64)untag((void *)begin);
+    bpf_probe_read_user(&size, sizeof(u32), (void *)(begin + 0x20));
 
     // read one byte to check if readable
     bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
 
-    if(begin != 0 && size != 0) {
-        if (size < 0){
-            return 0;
-        }
-
+    if(begin != 0 && size >= 0x70 && size <= (512 * 1024 * 1024)) {
         if (ch == 0x64) {
             u32 exist = 1;
             u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
@@ -453,7 +449,7 @@ int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
 SEC("uprobe/libart_nterpOpInvoke")
 int uprobe_libart_nterpOpInvoke(struct pt_regs *ctx)
 {
-    u32 pid = bpf_get_current_pid_tgid();
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (!trace_allowed(0, bpf_get_current_uid_gid())){
         return 0;
     }
@@ -478,15 +474,12 @@ int uprobe_libart_nterpOpInvoke(struct pt_regs *ctx)
     u32 size = 0;
     u8 ch = 0;
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
-    bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
+    begin = (u64)untag((void *)begin);
+    bpf_probe_read_user(&size, sizeof(u32), (void *)(begin + 0x20));
     // read one byte to check if readable
     bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
 
-    if(begin != 0 && size != 0) {
-        if (size < 0){
-            return 0;
-        }
-
+    if(begin != 0 && size >= 0x70 && size <= (512 * 1024 * 1024)) {
         if (ch == 0x64) {
             u32 exist = 1;
             u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
@@ -516,7 +509,7 @@ int uprobe_libart_nterpOpInvoke(struct pt_regs *ctx)
 SEC("uprobe/libart_verifyClass")
 int uprobe_libart_verifyClass(struct pt_regs *ctx)
 {
-    u32 pid = bpf_get_current_pid_tgid();
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (!trace_allowed(0, bpf_get_current_uid_gid())){
         return 0;
     }
@@ -530,13 +523,11 @@ int uprobe_libart_verifyClass(struct pt_regs *ctx)
     u32 size = 0;
     u8 ch = 0;
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
-    bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
+    begin = (u64)untag((void *)begin);
+    bpf_probe_read_user(&size, sizeof(u32), (void *)(begin + 0x20));
+    bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
 
-    if(begin != 0 && size != 0) {
-        if (size < 0){
-            return 0;
-        }
-
+    if(begin != 0 && size >= 0x70 && size <= (512 * 1024 * 1024) && ch == 0x64) {
         u32 exist = 1;
         u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
 

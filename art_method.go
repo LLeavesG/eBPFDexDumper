@@ -8,7 +8,7 @@ package main
 #include <unistd.h>
 #include <stdint.h>
 
-extern ssize_t readRemoteMem(pid_t pid, void *dst, size_t len, void *src);
+extern ssize_t readRemoteMem(pid_t pid, void *dst, size_t len, uintptr_t src);
 */
 import "C"
 
@@ -71,7 +71,7 @@ func readArtMethodFromRemote(pid uint32, artMethodPtr uintptr) (*ArtMethod, erro
 		C.pid_t(pid),
 		unsafe.Pointer(&artMethodData[0]),
 		C.size_t(len(artMethodData)),
-		unsafe.Pointer(artMethodPtr),
+		C.uintptr_t(artMethodPtr),
 	)
 
 	if nread < 0 {
@@ -91,7 +91,7 @@ func getDexFileFromArtMethod(pid uint32, artMethod *ArtMethod) (uint64, error) {
 		C.pid_t(pid),
 		unsafe.Pointer(&classPtr),
 		C.size_t(unsafe.Sizeof(classPtr)),
-		unsafe.Pointer(uintptr(artMethod.DeclaringClass)),
+		C.uintptr_t(artMethod.DeclaringClass),
 	)
 
 	if nread < 0 {
@@ -104,7 +104,7 @@ func getDexFileFromArtMethod(pid uint32, artMethod *ArtMethod) (uint64, error) {
 		C.pid_t(pid),
 		unsafe.Pointer(&dexCachePtr),
 		C.size_t(unsafe.Sizeof(dexCachePtr)),
-		unsafe.Pointer(classPtr+0x10),
+		C.uintptr_t(classPtr+0x10),
 	)
 
 	if nread < 0 {
@@ -117,7 +117,7 @@ func getDexFileFromArtMethod(pid uint32, artMethod *ArtMethod) (uint64, error) {
 		C.pid_t(pid),
 		unsafe.Pointer(&dexFilePtr),
 		C.size_t(unsafe.Sizeof(dexFilePtr)),
-		unsafe.Pointer(dexCachePtr+0x10),
+		C.uintptr_t(dexCachePtr+0x10),
 	)
 
 	if nread < 0 {
@@ -130,7 +130,7 @@ func getDexFileFromArtMethod(pid uint32, artMethod *ArtMethod) (uint64, error) {
 		C.pid_t(pid),
 		unsafe.Pointer(&begin),
 		C.size_t(unsafe.Sizeof(begin)),
-		unsafe.Pointer(dexFilePtr+0x8),
+		C.uintptr_t(dexFilePtr+0x8),
 	)
 
 	if nread < 0 {
@@ -178,7 +178,7 @@ func getArtMethodFromShadowFrame(pid uint32, shadowFramePtr uintptr) (uintptr, e
 		C.pid_t(pid),
 		unsafe.Pointer(&artMethodPtr),
 		C.size_t(unsafe.Sizeof(artMethodPtr)),
-		unsafe.Pointer(shadowFramePtr+8),
+		C.uintptr_t(shadowFramePtr+8),
 	)
 
 	if nread < 0 {
