@@ -586,11 +586,50 @@ func (dd *DexDumper) flushJSON() {
 	}
 }
 
-// 接收状态结构：重组 eBPF 分片
+// 接收状态：重组 eBPF 分片。用合并后的覆盖区间判断是否收齐，
+// 不能用 max(offset+len)：乱序时最后一片先到会误判完成并留下中间空洞。
 type dexRecvState struct {
-	total uint32
-	recv  uint32
-	buf   []byte
+	total  uint32
+	buf    []byte
+	ranges [][2]uint32 // merged [start, end) byte ranges received
+}
+
+// mergeDexRange inserts [start, end) into a sorted, non-overlapping interval list.
+func mergeDexRange(ranges [][2]uint32, start, end uint32) [][2]uint32 {
+	if start >= end {
+		return ranges
+	}
+	out := make([][2]uint32, 0, len(ranges)+1)
+	inserted := false
+	for _, r := range ranges {
+		if r[1] < start {
+			out = append(out, r)
+			continue
+		}
+		if r[0] > end {
+			if !inserted {
+				out = append(out, [2]uint32{start, end})
+				inserted = true
+			}
+			out = append(out, r)
+			continue
+		}
+		// Overlap or abut: grow the new interval and drop r.
+		if r[0] < start {
+			start = r[0]
+		}
+		if r[1] > end {
+			end = r[1]
+		}
+	}
+	if !inserted {
+		out = append(out, [2]uint32{start, end})
+	}
+	return out
+}
+
+func dexRangesComplete(ranges [][2]uint32, total uint32) bool {
+	return total > 0 && len(ranges) == 1 && ranges[0][0] == 0 && ranges[0][1] >= total
 }
 
 func (dd *DexDumper) handleDexChunkEventRingBuf(CPU int, data []byte, ringBuf *manager.RingbufMap, mgr *manager.Manager) {
@@ -615,52 +654,50 @@ func (dd *DexDumper) handleDexChunkEventRingBuf(CPU int, data []byte, ringBuf *m
 	}
 
 	begin := hdr.Begin
+	// Fallback may have already assembled a complete DEX; ignore late chunks.
+	if dexCache.GetParser(begin) != nil {
+		return
+	}
+
 	dd.pendingDexMu.Lock()
 	st, ok := dd.pendingDex[begin]
 	if !ok {
-		// init new state
 		st = &dexRecvState{total: hdr.Size, buf: make([]byte, hdr.Size)}
 		dd.pendingDex[begin] = st
-		// record size for later JSON name
 		dd.dexSizesMu.Lock()
 		dd.dexSizes[begin] = hdr.Size
 		dd.dexSizesMu.Unlock()
 	}
-	// bounds check
-	if uint64(hdr.Offset)+uint64(hdr.DataLen) <= uint64(len(st.buf)) {
+	if uint64(hdr.Offset)+uint64(hdr.DataLen) <= uint64(len(st.buf)) && hdr.DataLen > 0 {
 		copy(st.buf[hdr.Offset:uint32(hdr.Offset)+hdr.DataLen], payload)
-		// update received length conservatively; allow duplicates
-		if st.recv < hdr.Offset+hdr.DataLen {
-			st.recv = hdr.Offset + hdr.DataLen
-		}
+		st.ranges = mergeDexRange(st.ranges, hdr.Offset, hdr.Offset+hdr.DataLen)
 	}
 
-	// completed?
-	if st.recv >= st.total {
-		dataCopy := st.buf
-		// finalize
-		delete(dd.pendingDex, begin)
+	if !dexRangesComplete(st.ranges, st.total) {
 		dd.pendingDexMu.Unlock()
-
-		if err := dexCache.AddDexFile(begin, dataCopy); err != nil {
-			log.Printf("Failed to add dex file to cache: %v", err)
-		}
-
-		fileName := fmt.Sprintf("%s/dex_%x_%x.dex", outputPath, begin, hdr.Size)
-		f, err := os.Create(fileName)
-		if err != nil {
-			log.Printf("Create file failed: %v", err)
-			return
-		}
-		defer f.Close()
-		if _, err := f.Write(dataCopy); err != nil {
-			log.Printf("Write dexData failed: %v", err)
-			return
-		}
-		log.Printf("Dex file saved to %s, size %d", fileName, len(dataCopy))
 		return
 	}
+
+	dataCopy := append([]byte(nil), st.buf...)
+	delete(dd.pendingDex, begin)
 	dd.pendingDexMu.Unlock()
+
+	if err := dexCache.AddDexFile(begin, dataCopy); err != nil {
+		log.Printf("Failed to add dex file to cache: %v", err)
+	}
+
+	fileName := fmt.Sprintf("%s/dex_%x_%x.dex", outputPath, begin, hdr.Size)
+	f, err := os.Create(fileName)
+	if err != nil {
+		log.Printf("Create file failed: %v", err)
+		return
+	}
+	defer f.Close()
+	if _, err := f.Write(dataCopy); err != nil {
+		log.Printf("Write dexData failed: %v", err)
+		return
+	}
+	log.Printf("Dex file saved to %s, size %d", fileName, len(dataCopy))
 }
 
 // handleJniEventRingBuf receives one RegisterNatives entry and records it for
