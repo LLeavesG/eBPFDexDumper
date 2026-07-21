@@ -781,10 +781,11 @@ const (
 	dexReadChunkSize = 4096
 )
 
-// readRemoteRange reads len(buf) bytes at base from pid. Tries one contiguous
+// readRemoteDexRange reads len(buf) bytes at base from pid. Tries one contiguous
 // process_vm_readv first; on failure falls back to page-sized reads so a single
 // unreadable hole does not abandon the whole DEX.
-func readRemoteRange(pid int, base uint64, buf []byte) int {
+// Named distinctly from so_dumper.readRemoteRange (same package, different C helper).
+func readRemoteDexRange(pid int, base uint64, buf []byte) int {
 	if len(buf) == 0 {
 		return 0
 	}
@@ -819,7 +820,7 @@ func (dd *DexDumper) readRemoteDexFallback(begin uint64, pid uint32, totalSize u
 	}
 
 	buf := make([]byte, totalSize)
-	got := readRemoteRange(int(pid), begin, buf)
+	got := readRemoteDexRange(int(pid), begin, buf)
 	if got == 0 {
 		errno := C.readRemoteErrno()
 		log.Printf("readRemoteMem failed for dex 0x%x: got=0 errno=%d (%s) pid=%d size=%d off=%d",
@@ -843,7 +844,7 @@ func (dd *DexDumper) readRemoteDexFallback(begin uint64, pid uint32, totalSize u
 				// Header claims more than the event size; try to extend.
 				bigger := make([]byte, hdrSize)
 				copy(bigger, buf[:got])
-				extra := readRemoteRange(int(pid), begin+uint64(got), bigger[got:])
+				extra := readRemoteDexRange(int(pid), begin+uint64(got), bigger[got:])
 				if uint32(got+extra) >= hdrSize {
 					buf = bigger
 					outSize = hdrSize
