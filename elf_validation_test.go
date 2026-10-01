@@ -47,7 +47,7 @@ func TestFixSoHeaderOnlyBothClasses(t *testing.T) {
 			dir := t.TempDir()
 			in, out := filepath.Join(dir, "in.so"), filepath.Join(dir, "out.so")
 			writeTestFile(t, in, data)
-			if err := FixOneSo(in, out); err != nil {
+			if err := FixOneSo(in, out, nil); err != nil {
 				t.Fatal(err)
 			}
 			fixed, err := os.ReadFile(out)
@@ -88,7 +88,7 @@ func TestFixSoRejectsMalformedProgramHeaders(t *testing.T) {
 			dir := t.TempDir()
 			in, out := filepath.Join(dir, "in.so"), filepath.Join(dir, "out.so")
 			writeTestFile(t, in, data)
-			if err := FixOneSo(in, out); err == nil {
+			if err := FixOneSo(in, out, nil); err == nil {
 				t.Fatal("accepted malformed ELF header")
 			}
 		})

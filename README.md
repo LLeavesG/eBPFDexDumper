@@ -5,7 +5,7 @@
 
 [中文](README.md) | [English](README_en.md)
 
-基于 eBPF 技术的 Android 内存 DEX 转储工具。
+基于 eBPF 与进程内存读取的 Android 内存脱壳 / 分析工具：转储并修复 **DEX** 与 **native .so**，并可恢复动态注册的 **JNI** 符号。
 
 ## 特性
 - **不可检测**: 使用 eBPF 探针进行隐蔽操作
@@ -13,24 +13,25 @@
 - **实时追踪**: 可选的方法执行监控
 - **自动修复**: 内置 DEX 文件修复功能
 - **Native 层转储与修复**: 从进程内存转储 .so 动态库(含自映射的匿名 ELF 镜像),自动从 `.dynamic` 段重建完整 section header 表,让 IDA/Ghidra 直接识别符号、导入导出与重定位。支持 **ARM64/ELF64 与 ARM32/ELF32**、**Android packed 重定位**(APS2 / RELR),可 **watch 运行时解密**、按需**过滤系统库**
+- **JNI 动态注册名恢复**: `dump` 时自动定位 libart `RegisterNatives`(符号或字符串 xref),抓取动态注册的 native 方法名,经 `fixso --symbols` 注入到 dump 的 .so,供 IDA 识别
 - **高性能**: 使用无锁缓存和优化的字符串处理
-- **简化操作**: 智能默认配置，一条命令完成转储和修复
+- **简化操作**: 智能默认配置；`dump` / `dumpso` 可自动修复，JNI 偏移默认可自动识别
 
 **展示**: https://blog.lleavesg.top/article/eBPFDexDumper
 
 ## 支持环境
-- **测试环境**: Android 13 (Pixel 6)
+- **测试环境**: Android 13 / Android 16 (Pixel 6)
 - **架构**: ARM64
 - **要求**: 需要 Root 权限
 
-**注意**: 在其他 Android 版本上可能需要微调并重新编译。
+**注意**: 在其他 Android 版本上可能需要微调并重新编译。`RegisterNatives` / `Execute` 等偏移在未指定时会尝试自动识别。
 
 ## 先决条件
-工具默认会自动删除应用的 OAT 优化输出以避免 `cdex` 或空结果。如需手动操作：
+`dump` 默认会自动删除应用的 OAT 优化输出，以避免 `cdex` 或空结果。如需手动操作：
 - 查找基础路径: `pm path <package>`
 - 删除 oat 文件夹: 删除 `/data/app/.../<package>/` 下的应用 `oat/` 目录
 
-通常需要 Root 权限来附加探针和读取目标内存。
+通常需要 Root 权限：附加 eBPF uprobe（`dump`）、读取目标进程 `/proc/<pid>/maps` 与内存（`dump` / `dumpso`）。
 
 ## 使用方法
 
@@ -60,6 +61,7 @@ eBPFDexDumper [命令] [选项]
 - `--no-auto-fix` - 禁用自动修复 DEX
 - `--execute-offset <value>` - art::interpreter::Execute 函数的手动偏移量（十六进制值，例如 0x12345）(不指定参数会自动寻找)
 - `--nterp-offset <value>` - ExecuteNterpImpl 函数的手动偏移量（十六进制值，例如 0x12345）(不指定参数会自动寻找)
+- `--register-natives-offset <value>` - art::JNI<>::RegisterNatives 的手动偏移量（十六进制值，例如 0x4d1ef4）(不指定参数会自动寻找；见下方 JNI 说明)
 
 **示例:**
 ```bash
@@ -83,6 +85,9 @@ eBPFDexDumper [命令] [选项]
 
 # 为特定 ART 版本使用手动偏移量
 ./eBPFDexDumper dump -n com.example.app --execute-offset 0x12345 --nterp-offset 0x67890
+
+# 手动指定 RegisterNatives 偏移（一般无需；自动识别失败时再用）
+./eBPFDexDumper dump -n com.example.app --register-natives-offset 0x4d1ef4
 ```
 
 **输出文件:**
@@ -116,7 +121,7 @@ eBPFDexDumper [命令] [选项]
 - `--no-anon` - 禁用匿名 ELF 区域扫描
 - `--no-auto-fix` - 禁用自动修复
 - `--include-system` - 同时转储 `/system`、`/apex`、`/vendor` 下的系统库(默认跳过)
-- `--watch, -w` - 持续监控进程,模块一出现就转储(捕获运行时解密的库)
+- `--watch, -w` - 持续监控进程,模块一出现就转储,内容变化(如原地解密)时再次转储(捕获运行时解密的库)
 - `--watch-interval <秒>` - `--watch` 模式下重新扫描 maps 的间隔(默认值:1)
 - `--watch-timeout <秒>` - `--watch` 运行多少秒后停止(0 = 直到中断,默认值:60)
 
@@ -146,11 +151,51 @@ eBPFDexDumper [命令] [选项]
 
 **选项:**
 - `--dir, -d <dir>` - 包含转储 .so 文件的目录(必需)
+- `--symbols, -s <file>` - 注入符号映射文件(每行 `偏移 名字`),写入真实 `.symtab`,常用于恢复 JNI 函数名。文件名形如 `jni_symbols_<模块>.txt` 时,符号只注入到名字匹配的那个 .so,不会污染同目录里的其它库
 
 **示例:**
 ```bash
 ./eBPFDexDumper fixso -d /data/local/tmp/so_out
+
+# 注入 dump 阶段抓到的 JNI 符号,让 IDA 显示真实函数名
+./eBPFDexDumper fixso -d /data/local/tmp/so_out -s /data/local/tmp/dex_out/jni_symbols_libxxx.txt
 ```
+
+### JNI 符号恢复(动态注册)
+
+大量加固/正常 app 通过 `RegisterNatives` **动态注册** JNI 函数,这些函数在 .so 里没有导出符号,IDA 只显示 `sub_XXXX`。本工具在 `dump`(DEX 脱壳)运行时用 eBPF uprobe 挂 libart 的 `RegisterNatives`,抓取 `{函数指针, 方法名, 签名}`,按模块解析成 `偏移 名字` 写到输出目录的 `jni_symbols_<模块>.txt`;再用 `fixso --symbols` 注入到对应 dump 的 so,IDA 便能显示真实的 JNI 函数名。
+
+**`RegisterNatives` 偏移自动识别**(默认启用,无需手动传参),查找顺序:
+
+1. `--register-natives-offset` 手动指定(若提供)
+2. 从 libart 的符号表 / dynsym 扫描(优先 `art::JNI<false>` / mangling 含 `Lb0E`,避免挂到 CheckJNI 变体)
+3. **字符串 xref**(现代剥离版 ART 常用路径):在 libart 中定位 AOSP 警告串  
+   `This is slow, consider changing your RegisterNatives calls.`  
+   (备选: `JNI RegisterNativeMethods: attempt to register 0 native methods for `),解析 ARM64 `ADRP+ADD`/`ADR` 引用并回溯函数入口;若命中默认实现与 CheckJNI 两处,优先选择落在 `JNINativeInterface` 函数表槽位中的那个(相邻槽为 `UnregisterNatives`)
+
+自动识别失败时日志会提示 `JNI name recovery disabled`,此时可用 `--register-natives-offset` 手动指定。启动成功时可见类似输出:
+
+```text
+[+] RegisterNatives found by string xref at 0x4d1ef4
+[+] JNI RegisterNatives hook enabled (libart offset 0x4d1ef4)
+[+] Captured N JNI method(s) across M module(s); wrote jni_symbols_*.txt ...
+```
+
+```bash
+# 1) 脱壳(同时自动挂 RegisterNatives,抓 JNI 映射 → jni_symbols_*.txt)
+./eBPFDexDumper dump -n com.example.app
+# 2) 转储 native so
+./eBPFDexDumper dumpso -n com.example.app -o /data/local/tmp/so_out
+# 3) 修复并注入 JNI 符号(文件名 jni_symbols_<模块>.txt 时只注入到同名 so)
+./eBPFDexDumper fixso -d /data/local/tmp/so_out -s /data/local/tmp/dex_out/jni_symbols_libnative.txt
+```
+
+> 注:eBPF 抓取依赖 ARM64 设备;`.symtab` 注入本身与架构无关,可注入任意来源(eBPF/Frida/手工)的 `偏移 名字` 映射。请在目标 app **冷启动前** 先跑 `dump`,以便捕获启动阶段的 `RegisterNatives` 调用。
+
+### 限制与后续
+
+- **CompactDex(cdex)**:高版本 ART 的压缩 DEX 格式。本工具会**检测并给出提示**,但暂不做 `cdex→dex` 完整转换(CodeItem 需解压重组);遇到时请先用 [vdexExtractor](https://github.com/anestisb/vdexExtractor) 等工具转换。
+- **抽取型加固的主动触发**:eBPF 是**只读观测**模型,无法主动调用目标进程的方法去强制解密未执行的方法体;这类"主动脱壳"需要代码注入(如 Frida/ptrace),不在本工具的 eBPF 模型内。当前 `dump` 只捕获**运行时被执行到**的方法。
 
 ## 安装与构建
 

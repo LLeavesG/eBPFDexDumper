@@ -8,6 +8,7 @@ const struct method_event_data_t *unused_method_event_data_t __attribute__((unus
 const buf_t *unused_buf_t __attribute__((unused));
 const struct dex_chunk_event_t *unused_dex_chunk_event_t __attribute__((unused));
 const struct dex_read_failure_t *unused_dex_read_failure_t __attribute__((unused));
+const struct jni_method_event_t *unused_jni_method_event_t __attribute__((unused));
 
 static int config_loaded = 0;
 static bool filter_enable = false;
@@ -245,11 +246,82 @@ bool trace_allowed(u32 pid, u32 uid)
     return true;
 }
 
+// JNINativeMethod for a 64-bit (ARM64/ELF64) process. The field offsets and the
+// 24-byte stride below assume 8-byte pointers:
+//   const char* name;      // +0
+//   const char* signature; // +8
+//   void*       fnPtr;     // +16
+// The uprobe attaches to the 64-bit lib64 libart by default, so it only fires
+// for 64-bit targets. A 32-bit (armeabi-v7a) process has a 12-byte struct with
+// 4-byte fields; there the reads below fail safe (out-of-range pointers ->
+// empty name -> dropped by the Go side) instead of emitting wrong symbols.
+#define JNI_NATIVE_METHOD_SIZE 24
+#define JNI_MAX_METHODS 512
+
+// uprobe on art::JNI<>::RegisterNatives(JNIEnv*, jclass, const JNINativeMethod*,
+// jint). Walks the methods array and emits {fn_ptr, name, sig} for each, so the
+// Go side can recover names for dynamically-registered JNI functions (which
+// carry no export symbol in the .so). The class pointer (PARM2) is deliberately
+// not dereferenced: resolving it needs version-specific ART mirror layout,
+// whereas the JNINativeMethod fields are plain C strings/pointers.
+SEC("uprobe/libart_registerNatives")
+int uprobe_libart_registerNatives(struct pt_regs *ctx)
+{
+    // Use the TGID (process id), not the low-32 TID: writeJniSymbols resolves
+    // fn_ptr against /proc/<pid>/maps later, at Stop. A registering worker
+    // thread may have exited by then, but the thread-group leader (tgid) lives
+    // for the whole process and shares the same address space.
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (!trace_allowed(0, bpf_get_current_uid_gid())) {
+        return 0;
+    }
+
+    unsigned char *methods = (unsigned char *)PT_REGS_PARM3(ctx);
+    int count = (int)PT_REGS_PARM4(ctx);
+    if (methods == 0 || count <= 0) {
+        return 0;
+    }
+    if (count > JNI_MAX_METHODS) {
+        count = JNI_MAX_METHODS;
+    }
+
+    for (int i = 0; i < count && i < JNI_MAX_METHODS; i++) {
+        unsigned char *entry = methods + (long)i * JNI_NATIVE_METHOD_SIZE;
+        u64 name_ptr = 0, sig_ptr = 0, fn_ptr = 0;
+        bpf_probe_read_user(&name_ptr, sizeof(u64), entry + 0);
+        bpf_probe_read_user(&sig_ptr, sizeof(u64), entry + 8);
+        bpf_probe_read_user(&fn_ptr, sizeof(u64), entry + 16);
+        if (fn_ptr == 0) {
+            continue;
+        }
+        struct jni_method_event_t *e =
+            (struct jni_method_event_t *)bpf_ringbuf_reserve(&jni_events, sizeof(struct jni_method_event_t), 0);
+        if (!e) {
+            continue;
+        }
+        // bpf_ringbuf_reserve does not zero the record; clear it so the bytes
+        // after each string's NUL aren't stale ring-buffer contents leaked to
+        // userspace (and so a failed read_user_str leaves a clean empty string).
+        __builtin_memset(e, 0, sizeof(*e));
+        e->pid = pid;
+        e->fn_ptr = fn_ptr;
+        if (name_ptr) {
+            bpf_probe_read_user_str(e->name, sizeof(e->name), (void *)name_ptr);
+        }
+        if (sig_ptr) {
+            bpf_probe_read_user_str(e->sig, sizeof(e->sig), (void *)sig_ptr);
+        }
+        bpf_ringbuf_submit(e, 0);
+    }
+    return 0;
+}
+
 SEC("uprobe/libart_execute")
 int uprobe_libart_execute(struct pt_regs *ctx)
 {
-
-    u32 pid = bpf_get_current_pid_tgid();
+    // TGID (process id): Go-side process_vm_readv / maps lookups need the
+    // thread-group leader, not a short-lived worker TID.
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (!trace_allowed(0, bpf_get_current_uid_gid())){
         return 0;
     }
@@ -279,16 +351,14 @@ int uprobe_libart_execute(struct pt_regs *ctx)
     u32 size = 0;
     u8 ch = 0;
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
-    bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
+    begin = (u64)untag((void *)begin);
+    bpf_probe_read_user(&size, sizeof(u32), (void *)(begin + 0x20));
 
     // read one byte to check if readable
     bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
 
-    if(begin != 0 && size != 0) {
-        if (size < 0){
-            return 0;
-        }
-
+    // Reject absurd sizes before spending ringbuf / process_vm_readv budget.
+    if(begin != 0 && size >= 0x70 && size <= (512 * 1024 * 1024)) {
         if (ch == 0x64) {
             u32 exist = 1;
             u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
@@ -318,7 +388,7 @@ int uprobe_libart_execute(struct pt_regs *ctx)
 SEC("uprobe/libart_executeNterpImpl")
 int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
 {
-    u32 pid = bpf_get_current_pid_tgid();
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (!trace_allowed(0, bpf_get_current_uid_gid())){
         return 0;
     }
@@ -343,16 +413,13 @@ int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
     u32 size = 0;
     u8 ch = 0;
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
-    bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
+    begin = (u64)untag((void *)begin);
+    bpf_probe_read_user(&size, sizeof(u32), (void *)(begin + 0x20));
 
     // read one byte to check if readable
     bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
 
-    if(begin != 0 && size != 0) {
-        if (size < 0){
-            return 0;
-        }
-
+    if(begin != 0 && size >= 0x70 && size <= (512 * 1024 * 1024)) {
         if (ch == 0x64) {
             u32 exist = 1;
             u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
@@ -382,7 +449,7 @@ int uprobe_libart_executeNterpImpl(struct pt_regs *ctx)
 SEC("uprobe/libart_nterpOpInvoke")
 int uprobe_libart_nterpOpInvoke(struct pt_regs *ctx)
 {
-    u32 pid = bpf_get_current_pid_tgid();
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (!trace_allowed(0, bpf_get_current_uid_gid())){
         return 0;
     }
@@ -407,15 +474,12 @@ int uprobe_libart_nterpOpInvoke(struct pt_regs *ctx)
     u32 size = 0;
     u8 ch = 0;
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
-    bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
+    begin = (u64)untag((void *)begin);
+    bpf_probe_read_user(&size, sizeof(u32), (void *)(begin + 0x20));
     // read one byte to check if readable
     bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
 
-    if(begin != 0 && size != 0) {
-        if (size < 0){
-            return 0;
-        }
-
+    if(begin != 0 && size >= 0x70 && size <= (512 * 1024 * 1024)) {
         if (ch == 0x64) {
             u32 exist = 1;
             u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
@@ -445,7 +509,7 @@ int uprobe_libart_nterpOpInvoke(struct pt_regs *ctx)
 SEC("uprobe/libart_verifyClass")
 int uprobe_libart_verifyClass(struct pt_regs *ctx)
 {
-    u32 pid = bpf_get_current_pid_tgid();
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (!trace_allowed(0, bpf_get_current_uid_gid())){
         return 0;
     }
@@ -459,13 +523,11 @@ int uprobe_libart_verifyClass(struct pt_regs *ctx)
     u32 size = 0;
     u8 ch = 0;
     bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + 0x8);
-    bpf_probe_read_user(&size, sizeof(u32), (void *)((unsigned long)untag((void *)begin) + 0x20));
+    begin = (u64)untag((void *)begin);
+    bpf_probe_read_user(&size, sizeof(u32), (void *)(begin + 0x20));
+    bpf_probe_read_user(&ch, sizeof(u8), (void *)begin);
 
-    if(begin != 0 && size != 0) {
-        if (size < 0){
-            return 0;
-        }
-
+    if(begin != 0 && size >= 0x70 && size <= (512 * 1024 * 1024) && ch == 0x64) {
         u32 exist = 1;
         u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
 

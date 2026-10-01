@@ -121,7 +121,7 @@ func TestFixSoDirectoryPreservesNestedNames(t *testing.T) {
 	for _, sub := range []string{"a", "b"} {
 		writeTestFile(t, filepath.Join(dir, sub, "libsame.so"), minimalSo())
 	}
-	if err := FixSoDirectory(dir); err != nil {
+	if err := FixSoDirectory(dir, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	for _, sub := range []string{"a", "b"} {
@@ -135,7 +135,7 @@ func TestFixSoDirectoryReportsPartialFailure(t *testing.T) {
 	dir := t.TempDir()
 	writeTestFile(t, filepath.Join(dir, "good.so"), minimalSo())
 	writeTestFile(t, filepath.Join(dir, "bad.so"), []byte("broken"))
-	if err := FixSoDirectory(dir); err == nil {
+	if err := FixSoDirectory(dir, nil, ""); err == nil {
 		t.Fatal("repair reported success despite corrupt .so")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "fix", "good_fix.so")); err != nil {

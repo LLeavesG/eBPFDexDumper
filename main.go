@@ -75,6 +75,7 @@ OPTIONS:
 					&cli.BoolFlag{Name: "no-auto-fix", Usage: "Disable automatic DEX fixing"},
 					&cli.Uint64Flag{Name: "execute-offset", Usage: "Manual offset for art::interpreter::Execute function (hex value, e.g. 0x12345)"},
 					&cli.Uint64Flag{Name: "nterp-offset", Usage: "Manual offset for ExecuteNterpImpl function (hex value, e.g. 0x12345)"},
+					&cli.Uint64Flag{Name: "register-natives-offset", Usage: "Manual offset for art::JNI<>::RegisterNatives (hex value, e.g. 0x12345); auto-detected via symbol or string xref when omitted"},
 				},
 				Action: func(c *cli.Context) error {
 					uid := uint32(c.Uint64("uid"))
@@ -86,6 +87,7 @@ OPTIONS:
 					autoFix := c.Bool("auto-fix") && !c.Bool("no-auto-fix")
 					executeOffset := c.Uint64("execute-offset")
 					nterpOffset := c.Uint64("nterp-offset")
+					registerNativesOffset := c.Uint64("register-natives-offset")
 
 					if err := os.MkdirAll(outputDir, 0755); err != nil {
 						return fmt.Errorf("failed to create output directory %s: %w", outputDir, err)
@@ -113,7 +115,7 @@ OPTIONS:
 						}
 					}
 
-					dumper := NewDexDumper(libArtPath, uid, outputDir, trace, autoFix, executeOffset, nterpOffset)
+					dumper := NewDexDumper(libArtPath, uid, outputDir, trace, autoFix, executeOffset, nterpOffset, registerNativesOffset)
 
 					ctx, cancel := context.WithCancel(context.Background())
 					defer cancel()
@@ -233,17 +235,24 @@ OPTIONS:
 
 					var dumped []string
 					if watch {
-						ctx, cancel := context.WithCancel(context.Background())
+						var ctx context.Context
+						var cancel context.CancelFunc
 						if watchTimeout > 0 {
 							ctx, cancel = context.WithTimeout(context.Background(), time.Duration(watchTimeout)*time.Second)
+						} else {
+							ctx, cancel = context.WithCancel(context.Background())
 						}
 						defer cancel()
 
 						sigChan := make(chan os.Signal, 1)
 						signal.Notify(sigChan, os.Interrupt, unix.SIGTERM)
+						defer signal.Stop(sigChan)
 						go func() {
-							<-sigChan
-							cancel()
+							select {
+							case <-sigChan:
+								cancel()
+							case <-ctx.Done():
+							}
 						}()
 
 						log.Printf("[+] Watching uid %d every %ds (timeout %ds; Ctrl-C to stop)...", uid, watchInterval, watchTimeout)
@@ -268,7 +277,7 @@ OPTIONS:
 
 					if autoFix && len(dumped) > 0 {
 						log.Printf("[+] Auto-fixing dumped .so files...")
-						if err := FixSoDirectory(outputDir); err != nil {
+						if err := FixSoDirectory(outputDir, nil, ""); err != nil {
 							log.Printf("[!] Auto-fix failed: %v", err)
 						}
 					}
@@ -295,10 +304,26 @@ OPTIONS:
    {{end}}`,
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "dir", Aliases: []string{"d"}, Usage: "Directory containing dumped .so files", Required: true},
+					&cli.StringFlag{Name: "symbols", Aliases: []string{"s"}, Usage: "File of 'offset name' lines to inject as .symtab symbols (e.g. recovered JNI functions)"},
 				},
 				Action: func(c *cli.Context) error {
 					outDir := c.String("dir")
-					if err := FixSoDirectory(outDir); err != nil {
+					var injected []InjectedSym
+					var symbolsTarget string
+					if sf := c.String("symbols"); sf != "" {
+						syms, err := parseSymbolFile(sf)
+						if err != nil {
+							return fmt.Errorf("read symbols file: %w", err)
+						}
+						injected = syms
+						symbolsTarget = moduleStemFromSymbolsFile(sf)
+						if symbolsTarget != "" {
+							log.Printf("[+] Loaded %d symbol(s) from %s (target module %q)", len(injected), sf, symbolsTarget)
+						} else {
+							log.Printf("[+] Loaded %d symbol(s) from %s; couldn't infer target module, will inject into every .so", len(injected), sf)
+						}
+					}
+					if err := FixSoDirectory(outDir, injected, symbolsTarget); err != nil {
 						return fmt.Errorf("fix so failed: %w", err)
 					}
 					log.Printf("Fix completed for directory: %s", outDir)
