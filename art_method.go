@@ -2,16 +2,6 @@
 
 package main
 
-/*
-#cgo CFLAGS: -D_GNU_SOURCE
-#include <sys/uio.h>
-#include <unistd.h>
-#include <stdint.h>
-
-extern ssize_t readRemoteMem(pid_t pid, void *dst, size_t len, uintptr_t src);
-*/
-import "C"
-
 import (
 	"fmt"
 	"log"
@@ -67,15 +57,8 @@ func (cache *DexFileCache) GetParser(begin uint64) *DexParser {
 func readArtMethodFromRemote(pid uint32, artMethodPtr uintptr) (*ArtMethod, error) {
 	artMethodData := make([]byte, unsafe.Sizeof(ArtMethod{}))
 
-	nread, _ := C.readRemoteMem(
-		C.pid_t(pid),
-		unsafe.Pointer(&artMethodData[0]),
-		C.size_t(len(artMethodData)),
-		C.uintptr_t(artMethodPtr),
-	)
-
-	if nread < 0 {
-		return nil, fmt.Errorf("failed to read ArtMethod from remote process")
+	if err := readRemoteMemory(pid, artMethodPtr, artMethodData); err != nil {
+		return nil, fmt.Errorf("failed to read ArtMethod from remote process: %w", err)
 	}
 
 	// 解析ArtMethod结构
@@ -87,54 +70,26 @@ func readArtMethodFromRemote(pid uint32, artMethodPtr uintptr) (*ArtMethod, erro
 func getDexFileFromArtMethod(pid uint32, artMethod *ArtMethod) (uint64, error) {
 	// declaring_class_是GcRoot<mirror::Class>，需要先解引用获取实际的Class指针
 	var classPtr uintptr
-	nread, _ := C.readRemoteMem(
-		C.pid_t(pid),
-		unsafe.Pointer(&classPtr),
-		C.size_t(unsafe.Sizeof(classPtr)),
-		C.uintptr_t(artMethod.DeclaringClass),
-	)
-
-	if nread < 0 {
-		return 0, fmt.Errorf("failed to read declaring class pointer")
+	if err := readRemoteMemory(pid, uintptr(artMethod.DeclaringClass), unsafe.Slice((*byte)(unsafe.Pointer(&classPtr)), unsafe.Sizeof(classPtr))); err != nil {
+		return 0, fmt.Errorf("failed to read declaring class pointer: %w", err)
 	}
 
 	// 从class对象获取dex_cache (Class对象+0x10偏移)
 	var dexCachePtr uintptr
-	nread, _ = C.readRemoteMem(
-		C.pid_t(pid),
-		unsafe.Pointer(&dexCachePtr),
-		C.size_t(unsafe.Sizeof(dexCachePtr)),
-		C.uintptr_t(classPtr+0x10),
-	)
-
-	if nread < 0 {
-		return 0, fmt.Errorf("failed to read dex_cache pointer")
+	if err := readRemoteMemory(pid, classPtr+0x10, unsafe.Slice((*byte)(unsafe.Pointer(&dexCachePtr)), unsafe.Sizeof(dexCachePtr))); err != nil {
+		return 0, fmt.Errorf("failed to read dex_cache pointer: %w", err)
 	}
 
 	// 从dex_cache获取dex_file
 	var dexFilePtr uintptr
-	nread, _ = C.readRemoteMem(
-		C.pid_t(pid),
-		unsafe.Pointer(&dexFilePtr),
-		C.size_t(unsafe.Sizeof(dexFilePtr)),
-		C.uintptr_t(dexCachePtr+0x10),
-	)
-
-	if nread < 0 {
-		return 0, fmt.Errorf("failed to read dex_file pointer")
+	if err := readRemoteMemory(pid, dexCachePtr+0x10, unsafe.Slice((*byte)(unsafe.Pointer(&dexFilePtr)), unsafe.Sizeof(dexFilePtr))); err != nil {
+		return 0, fmt.Errorf("failed to read dex_file pointer: %w", err)
 	}
 
 	// 从dex_file获取begin地址
 	var begin uint64
-	nread, _ = C.readRemoteMem(
-		C.pid_t(pid),
-		unsafe.Pointer(&begin),
-		C.size_t(unsafe.Sizeof(begin)),
-		C.uintptr_t(dexFilePtr+0x8),
-	)
-
-	if nread < 0 {
-		return 0, fmt.Errorf("failed to read dex file begin address")
+	if err := readRemoteMemory(pid, dexFilePtr+0x8, unsafe.Slice((*byte)(unsafe.Pointer(&begin)), unsafe.Sizeof(begin))); err != nil {
+		return 0, fmt.Errorf("failed to read dex file begin address: %w", err)
 	}
 
 	return begin, nil
@@ -174,15 +129,8 @@ func PrettyMethodFromArtMethod(pid uint32, artMethodPtr uintptr) (string, error)
 func getArtMethodFromShadowFrame(pid uint32, shadowFramePtr uintptr) (uintptr, error) {
 	var artMethodPtr uintptr
 
-	nread, _ := C.readRemoteMem(
-		C.pid_t(pid),
-		unsafe.Pointer(&artMethodPtr),
-		C.size_t(unsafe.Sizeof(artMethodPtr)),
-		C.uintptr_t(shadowFramePtr+8),
-	)
-
-	if nread < 0 {
-		return 0, fmt.Errorf("failed to read ArtMethod pointer from shadow frame")
+	if err := readRemoteMemory(pid, shadowFramePtr+8, unsafe.Slice((*byte)(unsafe.Pointer(&artMethodPtr)), unsafe.Sizeof(artMethodPtr))); err != nil {
+		return 0, fmt.Errorf("failed to read ArtMethod pointer from shadow frame: %w", err)
 	}
 
 	return artMethodPtr, nil

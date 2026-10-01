@@ -1,5 +1,3 @@
-//go:build arm64
-
 package main
 
 import (
@@ -130,6 +128,15 @@ func NewDexParser(data []byte) (*DexParser, error) {
 	return parser, nil
 }
 
+// dataRange checks offsets in 64 bits before slicing so damaged uint32 table
+// offsets and counts cannot wrap around into apparently valid file positions.
+func (p *DexParser) dataRange(offset, size uint64) ([]byte, error) {
+	if offset > uint64(len(p.data)) || size > uint64(len(p.data))-offset {
+		return nil, fmt.Errorf("dex data range out of bounds: offset=%d size=%d", offset, size)
+	}
+	return p.data[offset : offset+size], nil
+}
+
 // 读取字符串
 func (p *DexParser) GetString(stringIdx uint32) (string, error) {
 	if stringIdx >= p.header.StringIdsSize {
@@ -137,57 +144,50 @@ func (p *DexParser) GetString(stringIdx uint32) (string, error) {
 	}
 
 	// 获取string_id_item
-	stringIdOffset := p.header.StringIdsOff + stringIdx*4
-	if int(stringIdOffset+4) > len(p.data) {
-		return "", fmt.Errorf("string id offset out of bounds")
+	item, err := p.dataRange(uint64(p.header.StringIdsOff)+uint64(stringIdx)*4, 4)
+	if err != nil {
+		return "", fmt.Errorf("string id: %w", err)
 	}
-
-	stringDataOff := binary.LittleEndian.Uint32(p.data[stringIdOffset : stringIdOffset+4])
+	stringDataOff := binary.LittleEndian.Uint32(item)
 
 	// 读取字符串数据
 	return p.readStringData(stringDataOff)
 }
 
 // 读取字符串数据
+//
+// DEX 的 string_data_item 为: uleb128 编码的 utf16_size(UTF-16 代码单元数，
+// 并非字节数)，后跟以 0x00 结尾的 MUTF-8 字节序列。字符串的实际字节长度并不等于
+// utf16_size —— 非 ASCII 字符的 MUTF-8 编码会占用多个字节，若按 utf16_size 截取
+// 字节会把类名/方法名截断。因此这里扫描到 NUL 结束符来确定真实长度;MUTF-8 把真正
+// 的 NUL 编码成 0xC0 0x80，所以 0x00 字节一定是字符串结束标志。
 func (p *DexParser) readStringData(offset uint32) (string, error) {
 	if int(offset) >= len(p.data) {
 		return "", fmt.Errorf("string data offset out of bounds")
 	}
 
-	// 读取ULEB128长度
+	// 跳过 uleb128 的 utf16_size 前缀(仅是长度提示，不代表字节数)
 	pos := int(offset)
-	length, newPos := p.readULEB128(pos)
-	pos = newPos
-
-	if pos+int(length) > len(p.data) {
-		return "", fmt.Errorf("string data out of bounds")
+	_, pos = p.readULEB128(pos)
+	if pos < 0 {
+		return "", fmt.Errorf("invalid string length ULEB128")
 	}
 
-	return string(p.data[pos : pos+int(length)]), nil
+	// 从 pos 扫描到 NUL 结束符，得到实际字节长度
+	end := pos
+	for end < len(p.data) && p.data[end] != 0x00 {
+		end++
+	}
+	if end >= len(p.data) {
+		return "", fmt.Errorf("string data not NUL-terminated")
+	}
+
+	return string(p.data[pos:end]), nil
 }
 
 // 读取ULEB128
 func (p *DexParser) readULEB128(offset int) (uint32, int) {
-	var result uint32
-	var shift uint
-	pos := offset
-
-	for {
-		if pos >= len(p.data) {
-			break
-		}
-
-		b := p.data[pos]
-		pos++
-
-		result |= uint32(b&0x7f) << shift
-		if (b & 0x80) == 0 {
-			break
-		}
-		shift += 7
-	}
-
-	return result, pos
+	return readULEB128(p.data, offset)
 }
 
 // 获取类型描述符
@@ -197,12 +197,11 @@ func (p *DexParser) GetTypeDescriptor(typeIdx uint32) (string, error) {
 	}
 
 	// 获取type_id_item
-	typeIdOffset := p.header.TypeIdsOff + typeIdx*4
-	if int(typeIdOffset+4) > len(p.data) {
-		return "", fmt.Errorf("type id offset out of bounds")
+	item, err := p.dataRange(uint64(p.header.TypeIdsOff)+uint64(typeIdx)*4, 4)
+	if err != nil {
+		return "", fmt.Errorf("type id: %w", err)
 	}
-
-	descriptorIdx := binary.LittleEndian.Uint32(p.data[typeIdOffset : typeIdOffset+4])
+	descriptorIdx := binary.LittleEndian.Uint32(item)
 
 	return p.GetString(descriptorIdx)
 }
@@ -214,14 +213,13 @@ func (p *DexParser) GetMethodInfo(methodIdx uint32) (*MethodInfo, error) {
 	}
 
 	// 获取method_id_item
-	methodIdOffset := p.header.MethodIdsOff + methodIdx*8
-	if int(methodIdOffset+8) > len(p.data) {
-		return nil, fmt.Errorf("method id offset out of bounds")
+	item, err := p.dataRange(uint64(p.header.MethodIdsOff)+uint64(methodIdx)*8, 8)
+	if err != nil {
+		return nil, fmt.Errorf("method id: %w", err)
 	}
-
-	classIdx := binary.LittleEndian.Uint16(p.data[methodIdOffset : methodIdOffset+2])
-	protoIdx := binary.LittleEndian.Uint16(p.data[methodIdOffset+2 : methodIdOffset+4])
-	nameIdx := binary.LittleEndian.Uint32(p.data[methodIdOffset+4 : methodIdOffset+8])
+	classIdx := binary.LittleEndian.Uint16(item[:2])
+	protoIdx := binary.LittleEndian.Uint16(item[2:4])
+	nameIdx := binary.LittleEndian.Uint32(item[4:8])
 
 	// 获取类名
 	className, err := p.GetTypeDescriptor(uint32(classIdx))
@@ -270,14 +268,12 @@ func (p *DexParser) getProtoInfo(protoIdx uint32) (*ProtoInfo, error) {
 	}
 
 	// 获取proto_id_item
-	protoIdOffset := p.header.ProtoIdsOff + protoIdx*12
-	if int(protoIdOffset+12) > len(p.data) {
-		return nil, fmt.Errorf("proto id offset out of bounds")
+	item, err := p.dataRange(uint64(p.header.ProtoIdsOff)+uint64(protoIdx)*12, 12)
+	if err != nil {
+		return nil, fmt.Errorf("proto id: %w", err)
 	}
-
-	_ = binary.LittleEndian.Uint32(p.data[protoIdOffset : protoIdOffset+4]) // shortyIdx (unused)
-	returnTypeIdx := binary.LittleEndian.Uint32(p.data[protoIdOffset+4 : protoIdOffset+8])
-	parametersOff := binary.LittleEndian.Uint32(p.data[protoIdOffset+8 : protoIdOffset+12])
+	returnTypeIdx := binary.LittleEndian.Uint32(item[4:8])
+	parametersOff := binary.LittleEndian.Uint32(item[8:12])
 
 	// 获取返回类型
 	returnType, err := p.GetTypeDescriptor(returnTypeIdx)
@@ -301,25 +297,19 @@ func (p *DexParser) getProtoInfo(protoIdx uint32) (*ProtoInfo, error) {
 
 // 获取参数类型列表
 func (p *DexParser) getParameterTypes(offset uint32) ([]string, error) {
-	if int(offset) >= len(p.data) {
-		return nil, fmt.Errorf("parameter types offset out of bounds")
+	header, err := p.dataRange(uint64(offset), 4)
+	if err != nil {
+		return nil, fmt.Errorf("type list size: %w", err)
 	}
-
-	// 读取type_list
-	if int(offset+4) > len(p.data) {
-		return nil, fmt.Errorf("type list size out of bounds")
+	size := binary.LittleEndian.Uint32(header)
+	items, err := p.dataRange(uint64(offset)+4, uint64(size)*2)
+	if err != nil {
+		return nil, fmt.Errorf("type list items: %w", err)
 	}
-
-	size := binary.LittleEndian.Uint32(p.data[offset : offset+4])
 	var parameters []string
 
 	for i := uint32(0); i < size; i++ {
-		typeItemOffset := offset + 4 + i*2
-		if int(typeItemOffset+2) > len(p.data) {
-			return nil, fmt.Errorf("type item offset out of bounds")
-		}
-
-		typeIdx := binary.LittleEndian.Uint16(p.data[typeItemOffset : typeItemOffset+2])
+		typeIdx := binary.LittleEndian.Uint16(items[uint64(i)*2 : uint64(i)*2+2])
 		typeDesc, err := p.GetTypeDescriptor(uint32(typeIdx))
 		if err != nil {
 			return nil, fmt.Errorf("failed to get parameter type: %v", err)

@@ -271,19 +271,6 @@ func readRemoteRange(pid int, base uint64, buf []byte) int {
 	return total
 }
 
-func sanitizeSoName(name string) string {
-	name = strings.TrimSuffix(name, ".so")
-	var sb strings.Builder
-	for _, r := range name {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
-			sb.WriteRune(r)
-		} else {
-			sb.WriteByte('_')
-		}
-	}
-	return sb.String()
-}
-
 // DumpSoModules reads each module's full mapped span from pid's memory and
 // writes it as a raw file under outDir. Returns the paths written.
 func DumpSoModules(pid int, mods []soModule, outDir string) []string {

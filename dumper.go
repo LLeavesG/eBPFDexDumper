@@ -2,25 +2,6 @@
 
 package main
 
-/*
-#cgo CFLAGS: -D_GNU_SOURCE
-#include <sys/uio.h>
-#include <unistd.h>
-#include <stdint.h>
-#include <errno.h>
-
-// Remote address is uintptr_t, not void*: Go's cgocheck can panic if a remote
-// bit-pattern coincides with a local heap span when passed as unsafe.Pointer.
-ssize_t readRemoteMem(pid_t pid, void *dst, size_t len, uintptr_t src) {
-    struct iovec local_iov = { dst, len };
-    struct iovec remote_iov = { (void *)src, len };
-    return process_vm_readv(pid, &local_iov, 1, &remote_iov, 1, 0);
-}
-
-int readRemoteErrno(void) { return errno; }
-*/
-import "C"
-
 import (
 	"bufio"
 	"bytes"
@@ -57,11 +38,11 @@ type methodTask struct {
 }
 
 type DexDumper struct {
-	manager       *manager.Manager
-	libArtPath    string
-	uid           uint32
-	trace         bool
-	autoFix       bool
+	manager               *manager.Manager
+	libArtPath            string
+	uid                   uint32
+	trace                 bool
+	autoFix               bool
 	executeOffset         uint64
 	nterpOffset           uint64
 	registerNativesOffset uint64
@@ -476,10 +457,10 @@ func (dd *DexDumper) processMethodEvent(data []byte) {
 	// Read bytecode if present
 	var bytecode []byte
 	if methodHeader.CodeitemSize > 0 {
-		bytecode = make([]byte, methodHeader.CodeitemSize)
-		if err := binary.Read(buf, binary.LittleEndian, &bytecode); err != nil {
+		if uint64(methodHeader.CodeitemSize) > uint64(buf.Len()) {
 			return
 		}
+		bytecode = buf.Next(int(methodHeader.CodeitemSize))
 	}
 
 	parser := dexCache.GetParser(methodHeader.Begin)
@@ -586,52 +567,6 @@ func (dd *DexDumper) flushJSON() {
 	}
 }
 
-// 接收状态：重组 eBPF 分片。用合并后的覆盖区间判断是否收齐，
-// 不能用 max(offset+len)：乱序时最后一片先到会误判完成并留下中间空洞。
-type dexRecvState struct {
-	total  uint32
-	buf    []byte
-	ranges [][2]uint32 // merged [start, end) byte ranges received
-}
-
-// mergeDexRange inserts [start, end) into a sorted, non-overlapping interval list.
-func mergeDexRange(ranges [][2]uint32, start, end uint32) [][2]uint32 {
-	if start >= end {
-		return ranges
-	}
-	out := make([][2]uint32, 0, len(ranges)+1)
-	inserted := false
-	for _, r := range ranges {
-		if r[1] < start {
-			out = append(out, r)
-			continue
-		}
-		if r[0] > end {
-			if !inserted {
-				out = append(out, [2]uint32{start, end})
-				inserted = true
-			}
-			out = append(out, r)
-			continue
-		}
-		// Overlap or abut: grow the new interval and drop r.
-		if r[0] < start {
-			start = r[0]
-		}
-		if r[1] > end {
-			end = r[1]
-		}
-	}
-	if !inserted {
-		out = append(out, [2]uint32{start, end})
-	}
-	return out
-}
-
-func dexRangesComplete(ranges [][2]uint32, total uint32) bool {
-	return total > 0 && len(ranges) == 1 && ranges[0][0] == 0 && ranges[0][1] >= total
-}
-
 func (dd *DexDumper) handleDexChunkEventRingBuf(CPU int, data []byte, ringBuf *manager.RingbufMap, mgr *manager.Manager) {
 	if len(data) < int(unsafe.Sizeof(bpfDexChunkEventT{})) {
 		log.Printf("Dex chunk event too short: %d bytes", len(data))
@@ -645,59 +580,73 @@ func (dd *DexDumper) handleDexChunkEventRingBuf(CPU int, data []byte, ringBuf *m
 		return
 	}
 
-	payload := make([]byte, hdr.DataLen)
-	if hdr.DataLen > 0 {
-		if err := binary.Read(buf, binary.LittleEndian, &payload); err != nil {
-			log.Printf("Read dex chunk payload failed: %s", err)
-			return
-		}
+	if hdr.DataLen == 0 || uint64(hdr.DataLen) > uint64(buf.Len()) ||
+		uint64(hdr.Offset)+uint64(hdr.DataLen) > uint64(hdr.Size) {
+		log.Printf("Invalid dex chunk payload: offset=%d length=%d size=%d", hdr.Offset, hdr.DataLen, hdr.Size)
+		return
 	}
+	payload := buf.Next(int(hdr.DataLen))
 
 	begin := hdr.Begin
-	// Fallback may have already assembled a complete DEX; ignore late chunks.
+	// A completed fallback must not be replaced by late ring-buffer chunks.
 	if dexCache.GetParser(begin) != nil {
 		return
 	}
-
 	dd.pendingDexMu.Lock()
 	st, ok := dd.pendingDex[begin]
 	if !ok {
-		st = &dexRecvState{total: hdr.Size, buf: make([]byte, hdr.Size)}
+		// init new state
+		var err error
+		st, err = newDexRecvState(hdr.Size)
+		if err != nil {
+			dd.pendingDexMu.Unlock()
+			log.Printf("Invalid dex chunk: %v", err)
+			return
+		}
 		dd.pendingDex[begin] = st
+		// record size for later JSON name
 		dd.dexSizesMu.Lock()
 		dd.dexSizes[begin] = hdr.Size
 		dd.dexSizesMu.Unlock()
 	}
-	if uint64(hdr.Offset)+uint64(hdr.DataLen) <= uint64(len(st.buf)) && hdr.DataLen > 0 {
-		copy(st.buf[hdr.Offset:uint32(hdr.Offset)+hdr.DataLen], payload)
-		st.ranges = mergeDexRange(st.ranges, hdr.Offset, hdr.Offset+hdr.DataLen)
-	}
-
-	if !dexRangesComplete(st.ranges, st.total) {
+	if hdr.Size != st.total {
 		dd.pendingDexMu.Unlock()
+		log.Printf("Inconsistent dex chunk size: got %d, expected %d", hdr.Size, st.total)
 		return
 	}
-
-	dataCopy := append([]byte(nil), st.buf...)
-	delete(dd.pendingDex, begin)
-	dd.pendingDexMu.Unlock()
-
-	if err := dexCache.AddDexFile(begin, dataCopy); err != nil {
-		log.Printf("Failed to add dex file to cache: %v", err)
-	}
-
-	fileName := fmt.Sprintf("%s/dex_%x_%x.dex", outputPath, begin, hdr.Size)
-	f, err := os.Create(fileName)
+	complete, err := st.addChunk(hdr.Offset, payload)
 	if err != nil {
-		log.Printf("Create file failed: %v", err)
+		dd.pendingDexMu.Unlock()
+		log.Printf("Invalid dex chunk: %v", err)
 		return
 	}
-	defer f.Close()
-	if _, err := f.Write(dataCopy); err != nil {
-		log.Printf("Write dexData failed: %v", err)
+
+	// completed?
+	if complete {
+		dataCopy := st.buf
+		// finalize
+		delete(dd.pendingDex, begin)
+		dd.pendingDexMu.Unlock()
+
+		if err := dexCache.AddDexFile(begin, dataCopy); err != nil {
+			log.Printf("Failed to add dex file to cache: %v", err)
+		}
+
+		fileName := fmt.Sprintf("%s/dex_%x_%x.dex", outputPath, begin, hdr.Size)
+		f, err := os.Create(fileName)
+		if err != nil {
+			log.Printf("Create file failed: %v", err)
+			return
+		}
+		defer f.Close()
+		if _, err := f.Write(dataCopy); err != nil {
+			log.Printf("Write dexData failed: %v", err)
+			return
+		}
+		log.Printf("Dex file saved to %s, size %d", fileName, len(dataCopy))
 		return
 	}
-	log.Printf("Dex file saved to %s, size %d", fileName, len(dataCopy))
+	dd.pendingDexMu.Unlock()
 }
 
 // handleJniEventRingBuf receives one RegisterNatives entry and records it for
@@ -807,90 +756,23 @@ func (dd *DexDumper) handleReadFailureEventRingBuf(CPU int, data []byte, ringBuf
 	dd.readRemoteDexFallback(failureEvt.Begin, failureEvt.Pid, failureEvt.Size, failureEvt.FailedOffset)
 }
 
-// untagAddr clears TBI/PAC-style top-byte tags used by ART pointers.
-func untagAddr(addr uint64) uint64 {
-	return addr & 0x00ffffffffffffff
-}
-
-const (
-	maxDexDumpSize  = 512 * 1024 * 1024
-	minDexDumpSize  = 0x70
-	dexReadChunkSize = 4096
-)
-
-// readRemoteDexRange reads len(buf) bytes at base from pid. Tries one contiguous
-// process_vm_readv first; on failure falls back to page-sized reads so a single
-// unreadable hole does not abandon the whole DEX.
-// Named distinctly from so_dumper.readRemoteRange (same package, different C helper).
-func readRemoteDexRange(pid int, base uint64, buf []byte) int {
-	if len(buf) == 0 {
-		return 0
-	}
-	n := C.readRemoteMem(C.pid_t(pid), unsafe.Pointer(&buf[0]), C.size_t(len(buf)), C.uintptr_t(base))
-	if int(n) == len(buf) {
-		return len(buf)
-	}
-
-	total := 0
-	for off := 0; off < len(buf); off += dexReadChunkSize {
-		end := off + dexReadChunkSize
-		if end > len(buf) {
-			end = len(buf)
-		}
-		chunk := buf[off:end]
-		cn := C.readRemoteMem(C.pid_t(pid), unsafe.Pointer(&chunk[0]), C.size_t(len(chunk)), C.uintptr_t(base)+C.uintptr_t(off))
-		if int(cn) == len(chunk) {
-			total += len(chunk)
-		}
-	}
-	return total
-}
-
 func (dd *DexDumper) readRemoteDexFallback(begin uint64, pid uint32, totalSize uint32, startOffset uint32) {
 	begin = untagAddr(begin)
-	if totalSize < minDexDumpSize || totalSize > maxDexDumpSize {
-		log.Printf("readRemoteMem skip dex 0x%x: unreasonable size %d (pid=%d)", begin, totalSize, pid)
-		return
-	}
 	if dexCache.GetParser(begin) != nil {
-		return // already dumped/cached
-	}
-
-	buf := make([]byte, totalSize)
-	got := readRemoteDexRange(int(pid), begin, buf)
-	if got == 0 {
-		errno := C.readRemoteErrno()
-		log.Printf("readRemoteMem failed for dex 0x%x: got=0 errno=%d (%s) pid=%d size=%d off=%d",
-			begin, int(errno), unix.Errno(errno).Error(), pid, totalSize, startOffset)
 		return
 	}
-	if uint32(got) < totalSize {
-		log.Printf("readRemoteMem partial for dex 0x%x: %d/%d bytes (pid=%d)", begin, got, totalSize, pid)
+	buf, err := readDexImage(begin, totalSize, func(address uintptr, dst []byte) error {
+		return readMemoryRange(address, dst, func(address uintptr, dst []byte) error {
+			return readRemoteMemory(pid, address, dst)
+		})
+	})
+	if err != nil {
+		log.Printf("[dex-fallback] failed to read dex 0x%x (pid=%d off=%d): %v", begin, pid, startOffset, err)
+		return
 	}
-
-	// Prefer the on-disk/header file_size once we have a valid DEX header, so
-	// dumped length matches what tools expect ("大小不对" cases).
-	outSize := uint32(got)
-	if got >= 0x24 && bytes.HasPrefix(buf, []byte{'d', 'e', 'x', '\n'}) {
-		hdrSize := binary.LittleEndian.Uint32(buf[0x20:0x24])
-		if hdrSize >= minDexDumpSize && hdrSize <= maxDexDumpSize {
-			if hdrSize <= uint32(got) {
-				outSize = hdrSize
-				buf = buf[:hdrSize]
-			} else if hdrSize != totalSize && hdrSize <= maxDexDumpSize {
-				// Header claims more than the event size; try to extend.
-				bigger := make([]byte, hdrSize)
-				copy(bigger, buf[:got])
-				extra := readRemoteDexRange(int(pid), begin+uint64(got), bigger[got:])
-				if uint32(got+extra) >= hdrSize {
-					buf = bigger
-					outSize = hdrSize
-					log.Printf("[dex-fallback] resized dump 0x%x to header file_size %d", begin, hdrSize)
-				}
-			}
-		}
-	} else if got >= 4 {
-		log.Printf("[dex-fallback] warning: dex 0x%x missing magic after read (first4=%x)", begin, buf[:4])
+	outSize := uint32(len(buf))
+	if outSize != totalSize {
+		log.Printf("[dex-fallback] resized dump 0x%x to header file_size %d", begin, outSize)
 	}
 
 	dd.pendingDexMu.Lock()

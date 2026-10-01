@@ -1,9 +1,8 @@
-//go:build arm64
-
 package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -42,6 +41,13 @@ func FixOneSo(soPath, outPath string, injected []InjectedSym) error {
 	if data[4] != 1 && data[4] != 2 {
 		return fmt.Errorf("unsupported EI_CLASS=%d (want ELF32 or ELF64)", data[4])
 	}
+	if data[5] != 1 {
+		return fmt.Errorf("only little-endian images supported (EI_DATA=%d)", data[5])
+	}
+	l := elfLayout{is64: data[4] == 2}
+	if err := validateProgramHeaders(data, l); err != nil {
+		return err
+	}
 
 	// Preferred path: rebuild the section header table from the dynamic segment.
 	if rebuilt, rerr := RebuildSoSections(data, injected); rerr == nil {
@@ -60,10 +66,6 @@ func FixOneSo(soPath, outPath string, injected []InjectedSym) error {
 
 	// Fallback: normalize p_offset and zero out the section header table,
 	// class-aware so both ELF32 and ELF64 dumps still load via program headers.
-	l := elfLayout{is64: data[4] == 2}
-	if len(data) < l.ehdrSize() {
-		return fmt.Errorf("truncated ELF header")
-	}
 	phoff := l.phoff(data)
 	phentsize := l.phentsize(data)
 	phnum := l.phnum(data)
@@ -119,13 +121,23 @@ func FixOneSo(soPath, outPath string, injected []InjectedSym) error {
 // a non-empty injected set means the origin couldn't be determined (e.g. a
 // hand-written map): fall back to injecting into every .so.
 func FixSoDirectory(dir string, injected []InjectedSym, symbolsTarget string) error {
+	dir = filepath.Clean(dir)
+	info, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("not a directory: %s", dir)
+	}
+
 	fixDir := filepath.Join(dir, "fix")
 	if err := os.MkdirAll(fixDir, 0755); err != nil {
 		return fmt.Errorf("failed to create fix dir %s: %w", fixDir, err)
 	}
 
 	var count, injectedInto int
-	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+	var failures []error
+	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -140,15 +152,23 @@ func FixSoDirectory(dir string, injected []InjectedSym, symbolsTarget string) er
 			return nil
 		}
 
-		// Route the symbol map only to its own library.
+		relDir, err := filepath.Rel(dir, filepath.Dir(path))
+		if err != nil {
+			return err
+		}
+		outPath := filepath.Join(fixDir, relDir, strings.TrimSuffix(name, ".so")+"_fix.so")
+		if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
+			failures = append(failures, fmt.Errorf("create output directory: %w", err))
+			return nil
+		}
+		// Keep module-relative JNI symbols confined to their source library.
 		var syms []InjectedSym
 		if len(injected) > 0 && (symbolsTarget == "" || soMatchesModule(name, symbolsTarget)) {
 			syms = injected
 		}
-
-		outPath := filepath.Join(fixDir, strings.TrimSuffix(name, ".so")+"_fix.so")
 		if err := FixOneSo(path, outPath, syms); err != nil {
 			fmt.Fprintf(os.Stdout, "[!] Fix failed for %s: %v\n", path, err)
+			failures = append(failures, fmt.Errorf("fix %s: %w", path, err))
 			return nil
 		}
 		if len(syms) > 0 {
@@ -161,6 +181,9 @@ func FixSoDirectory(dir string, injected []InjectedSym, symbolsTarget string) er
 	})
 	if err != nil {
 		return err
+	}
+	if len(failures) > 0 {
+		return errors.Join(failures...)
 	}
 	if count == 0 {
 		return fmt.Errorf("no .so files found in %s", dir)

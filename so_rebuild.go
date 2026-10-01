@@ -1,5 +1,3 @@
-//go:build arm64
-
 package main
 
 import (
@@ -97,6 +95,29 @@ func (l elfLayout) shdrSize() int { return pick(l.is64, 64, 40) }
 func (l elfLayout) dynSize() int  { return pick(l.is64, 16, 8) }
 func (l elfLayout) symSize() int  { return pick(l.is64, 24, 16) }
 func (l elfLayout) word() uint64  { return uint64(pick(l.is64, 8, 4)) }
+
+func validateProgramHeaders(data []byte, l elfLayout) error {
+	if len(data) < l.ehdrSize() {
+		return fmt.Errorf("truncated ELF header")
+	}
+	offset := l.phoff(data)
+	stride := l.phentsize(data)
+	if stride == 0 {
+		stride = l.phdrSize()
+	}
+	count := l.phnum(data)
+	if offset == 0 || count == 0 {
+		return fmt.Errorf("no program headers")
+	}
+	if stride < l.phdrSize() {
+		return fmt.Errorf("program header entry too small: %d", stride)
+	}
+	size := uint64(count) * uint64(stride)
+	if offset > uint64(len(data)) || size > uint64(len(data))-offset {
+		return fmt.Errorf("program header table out of bounds")
+	}
+	return nil
+}
 
 func pick(is64 bool, a, b int) int {
 	if is64 {
@@ -296,6 +317,9 @@ func RebuildSoSections(image []byte, injected []InjectedSym) ([]byte, error) {
 	l := elfLayout{is64: data[4] == 2}
 	if len(data) < l.ehdrSize() {
 		return nil, fmt.Errorf("image smaller than ELF header")
+	}
+	if err := validateProgramHeaders(data, l); err != nil {
+		return nil, err
 	}
 
 	phoff := l.phoff(data)
