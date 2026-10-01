@@ -2,20 +2,6 @@
 
 package main
 
-/*
-#cgo CFLAGS: -D_GNU_SOURCE
-#include <sys/uio.h>
-#include <unistd.h>
-#include <stdint.h>
-
-ssize_t readRemoteMem(pid_t pid, void *dst, size_t len, void *src) {
-    struct iovec local_iov = { dst, len };
-    struct iovec remote_iov = { src, len };
-    return process_vm_readv(pid, &local_iov, 1, &remote_iov, 1, 0);
-}
-*/
-import "C"
-
 import (
 	"bufio"
 	"bytes"
@@ -429,10 +415,10 @@ func (dd *DexDumper) processMethodEvent(data []byte) {
 	// Read bytecode if present
 	var bytecode []byte
 	if methodHeader.CodeitemSize > 0 {
-		bytecode = make([]byte, methodHeader.CodeitemSize)
-		if err := binary.Read(buf, binary.LittleEndian, &bytecode); err != nil {
+		if uint64(methodHeader.CodeitemSize) > uint64(buf.Len()) {
 			return
 		}
+		bytecode = buf.Next(int(methodHeader.CodeitemSize))
 	}
 
 	parser := dexCache.GetParser(methodHeader.Begin)
@@ -539,13 +525,6 @@ func (dd *DexDumper) flushJSON() {
 	}
 }
 
-// 接收状态结构：重组 eBPF 分片
-type dexRecvState struct {
-	total uint32
-	recv  uint32
-	buf   []byte
-}
-
 func (dd *DexDumper) handleDexChunkEventRingBuf(CPU int, data []byte, ringBuf *manager.RingbufMap, mgr *manager.Manager) {
 	if len(data) < int(unsafe.Sizeof(bpfDexChunkEventT{})) {
 		log.Printf("Dex chunk event too short: %d bytes", len(data))
@@ -559,37 +538,45 @@ func (dd *DexDumper) handleDexChunkEventRingBuf(CPU int, data []byte, ringBuf *m
 		return
 	}
 
-	payload := make([]byte, hdr.DataLen)
-	if hdr.DataLen > 0 {
-		if err := binary.Read(buf, binary.LittleEndian, &payload); err != nil {
-			log.Printf("Read dex chunk payload failed: %s", err)
-			return
-		}
+	if hdr.DataLen == 0 || uint64(hdr.DataLen) > uint64(buf.Len()) ||
+		uint64(hdr.Offset)+uint64(hdr.DataLen) > uint64(hdr.Size) {
+		log.Printf("Invalid dex chunk payload: offset=%d length=%d size=%d", hdr.Offset, hdr.DataLen, hdr.Size)
+		return
 	}
+	payload := buf.Next(int(hdr.DataLen))
 
 	begin := hdr.Begin
 	dd.pendingDexMu.Lock()
 	st, ok := dd.pendingDex[begin]
 	if !ok {
 		// init new state
-		st = &dexRecvState{total: hdr.Size, buf: make([]byte, hdr.Size)}
+		var err error
+		st, err = newDexRecvState(hdr.Size)
+		if err != nil {
+			dd.pendingDexMu.Unlock()
+			log.Printf("Invalid dex chunk: %v", err)
+			return
+		}
 		dd.pendingDex[begin] = st
 		// record size for later JSON name
 		dd.dexSizesMu.Lock()
 		dd.dexSizes[begin] = hdr.Size
 		dd.dexSizesMu.Unlock()
 	}
-	// bounds check
-	if uint64(hdr.Offset)+uint64(hdr.DataLen) <= uint64(len(st.buf)) {
-		copy(st.buf[hdr.Offset:uint32(hdr.Offset)+hdr.DataLen], payload)
-		// update received length conservatively; allow duplicates
-		if st.recv < hdr.Offset+hdr.DataLen {
-			st.recv = hdr.Offset + hdr.DataLen
-		}
+	if hdr.Size != st.total {
+		dd.pendingDexMu.Unlock()
+		log.Printf("Inconsistent dex chunk size: got %d, expected %d", hdr.Size, st.total)
+		return
+	}
+	complete, err := st.addChunk(hdr.Offset, payload)
+	if err != nil {
+		dd.pendingDexMu.Unlock()
+		log.Printf("Invalid dex chunk: %v", err)
+		return
 	}
 
 	// completed?
-	if st.recv >= st.total {
+	if complete {
 		dataCopy := st.buf
 		// finalize
 		delete(dd.pendingDex, begin)
@@ -636,20 +623,15 @@ func (dd *DexDumper) handleReadFailureEventRingBuf(CPU int, data []byte, ringBuf
 }
 
 func (dd *DexDumper) readRemoteDexFallback(begin uint64, pid uint32, totalSize uint32, startOffset uint32) {
-	buf := make([]byte, totalSize)
-
-	ret := C.readRemoteMem(C.pid_t(pid), unsafe.Pointer(&buf[0]), C.size_t(totalSize),
-		unsafe.Pointer(uintptr(begin)))
-
-	if ret < 0 {
-		log.Printf("readRemoteMem failed for dex 0x%x: %d", begin, ret)
+	if totalSize == 0 || totalSize > maxDexDumpSize {
+		log.Printf("Invalid fallback dex size: %d", totalSize)
 		return
 	}
+	buf := make([]byte, totalSize)
 
-	readSize := uint32(ret)
-	if readSize != totalSize {
-		log.Printf("readRemoteMem partial read: expected %d, got %d", totalSize, readSize)
-		buf = buf[:readSize]
+	if err := readRemoteMemory(pid, uintptr(begin), buf); err != nil {
+		log.Printf("readRemoteMemory failed for dex 0x%x: %v", begin, err)
+		return
 	}
 
 	dd.pendingDexMu.Lock()

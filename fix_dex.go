@@ -1,11 +1,10 @@
-//go:build arm64
-
 package main
 
 import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/adler32"
 	"io/fs"
@@ -23,24 +22,29 @@ type jsonRepairRecord struct {
 
 // FixDexDirectory scans an output directory, pairs dex and code.json, and writes *_fix.dex
 func FixDexDirectory(outputDir string) error {
+	outputDir = filepath.Clean(outputDir)
+	fixDir := filepath.Join(outputDir, "fix")
 	// regex like: dex_<begin>_<size>_code.json
 	re := regexp.MustCompile(`^dex_([0-9a-fA-F]+)_([0-9a-fA-F]+)_code\.json$`)
 
-	// map key is base "dex_<begin>_<size>", value is json path
-	pairs := make(map[string]string)
+	// Keep the full paths: separate processes/subdirectories may use the same
+	// dump name. Pair each JSON with the DEX in its own directory.
+	var pairs []string
 
 	err := filepath.WalkDir(outputDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
+			if path == fixDir {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		name := filepath.Base(path)
 		m := re.FindStringSubmatch(name)
 		if len(m) == 3 {
-			base := fmt.Sprintf("dex_%s_%s", m[1], m[2])
-			pairs[base] = path
+			pairs = append(pairs, path)
 		}
 		return nil
 	})
@@ -51,29 +55,28 @@ func FixDexDirectory(outputDir string) error {
 	if len(pairs) == 0 {
 		return fmt.Errorf("no dex_*_code.json found in %s", outputDir)
 	}
-	// make fix dir in outputDir
-	fixDir := filepath.Join(outputDir, "fix")
-	if err := os.MkdirAll(fixDir, 0755); err != nil {
-		return fmt.Errorf("failed to create fix dir %s: %w", fixDir, err)
-	}
-
-	// Change to fix dir for output
-
-	for base, jsonPath := range pairs {
-		dexPath := filepath.Join(outputDir, base+".dex")
-		if _, err := os.Stat(dexPath); err != nil {
-			// no matching dex, skip
+	var failures []error
+	for _, jsonPath := range pairs {
+		base := filepath.Base(jsonPath)
+		base = base[:len(base)-len("_code.json")]
+		dexPath := filepath.Join(filepath.Dir(jsonPath), base+".dex")
+		relDir, err := filepath.Rel(outputDir, filepath.Dir(jsonPath))
+		if err != nil {
+			return err
+		}
+		outPath := filepath.Join(fixDir, relDir, base+"_fix.dex")
+		if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
+			failures = append(failures, fmt.Errorf("create output directory: %w", err))
 			continue
 		}
-		// 输出到 fix 子目录
-		outPath := filepath.Join(fixDir, base+"_fix.dex")
 		if err := FixOneDex(dexPath, jsonPath, outPath); err != nil {
 			fmt.Fprintf(os.Stdout, "[!] Fix failed for %s: %v\n", dexPath, err)
+			failures = append(failures, fmt.Errorf("fix %s: %w", dexPath, err))
 		} else {
 			fmt.Fprintf(os.Stdout, "[+] Wrote %s\n", outPath)
 		}
 	}
-	return nil
+	return errors.Join(failures...)
 }
 
 // FixOneDex applies JSON code patches into a single dex file and writes to outPath
@@ -160,11 +163,11 @@ func buildMethodCodeOffMap(p *DexParser) (map[uint32]uint32, error) {
 	// class_def_item is 32 bytes
 	const classDefSize = 32
 	for i := uint32(0); i < p.header.ClassDefsSize; i++ {
-		off := int(p.header.ClassDefsOff + i*classDefSize)
-		if off+classDefSize > len(p.data) {
-			return nil, fmt.Errorf("class_def OOB")
+		item, err := p.dataRange(uint64(p.header.ClassDefsOff)+uint64(i)*classDefSize, classDefSize)
+		if err != nil {
+			return nil, fmt.Errorf("class_def: %w", err)
 		}
-		classDataOff := le32(p.data[off+24:])
+		classDataOff := le32(item[24:])
 		if classDataOff == 0 {
 			continue
 		}
@@ -258,23 +261,21 @@ func buildMethodCodeOffMap(p *DexParser) (map[uint32]uint32, error) {
 // readULEB128 reads ULEB128 from data at pos, returns value and new pos (or -1 on error)
 func readULEB128(data []byte, pos int) (uint32, int) {
 	var result uint32
-	var shift uint
-	for {
-		if pos >= len(data) {
+	for shift := uint(0); shift <= 28; shift += 7 {
+		if pos < 0 || pos >= len(data) {
 			return 0, -1
 		}
 		b := data[pos]
 		pos++
-		result |= uint32(b&0x7f) << shift
-		if (b & 0x80) == 0 {
-			break
-		}
-		shift += 7
-		if shift > 28 { // sanity
+		if shift == 28 && b > 0x0f {
 			return 0, -1
 		}
+		result |= uint32(b&0x7f) << shift
+		if (b & 0x80) == 0 {
+			return result, pos
+		}
 	}
-	return result, pos
+	return 0, -1
 }
 
 // helper little-endian readers
